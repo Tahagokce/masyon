@@ -7,6 +7,8 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { Journal } from './recording.mjs';
 import { SecretGuard } from './security.mjs';
+import { inspectSnapshot, compactSnapshot } from './snapshot.mjs';
+import { executeBatch, screenStamp, BATCH_TOOLS } from './batch.mjs';
 
 const require = createRequire(import.meta.url);
 const ALLOWED = new Set(['browser_navigate', 'browser_navigate_back', 'browser_navigate_forward',
@@ -18,6 +20,13 @@ const str = { type: 'string' };
 const schema = (name, description, properties = {}, required = []) => ({name, description,
   inputSchema: {type: 'object', properties, required, additionalProperties: false}});
 export const CONTROL_TOOLS = [
+  schema('browser_batch', 'Execute up to five known actions on the same stable screen. Stops after click/key/submit or any UI transition. Inspect and replan remaining actions at the next checkpoint.',
+    {actions:{type:'array', minItems:1, maxItems:5, items:{type:'object', properties:{
+      tool:{type:'string', enum:BATCH_TOOLS}, arguments:{type:'object', properties:{
+        target:str, text:str, element:str, key:str, submit:{type:'boolean'},
+        values:{type:'array',items:str}, fields:{type:'array',items:{type:'object',properties:{
+          name:str,type:str,target:str,value:str},required:['name','type','target','value']}}
+      }}},required:['tool','arguments']}}}, ['actions']),
   schema('poc_preflight', 'Verify fork provenance and actual ID-first MCP code generation.'),
   schema('poc_record_start', 'Start actual MCP action recording after successful fork preflight.'),
   schema('poc_record_stop', 'Stop recording and export a TypeScript test.',
@@ -58,6 +67,9 @@ export class Runtime {
     this.verified = false;
     this.events = [];
     this.mcpCalls = 0;
+    this.snapshotCount = 0;
+    this.snapshotFallbackCount = 0;
+    this.navigationVersion = 0;
   }
   async initialize() {
     const launch = {headless: process.env.HEADLESS !== 'false'};
@@ -83,6 +95,10 @@ export class Runtime {
       const copy = structuredClone(t);
       delete copy.inputSchema.properties?.filename;
       delete copy.inputSchema.$schema;
+      if (copy.name === 'browser_snapshot') {
+        copy.description = 'Inspect a relevant visible target; defaults to last visible modal, otherwise page. Use scope=page explicitly to inspect outside a modal. Ambiguous scope falls back safely.';
+        copy.inputSchema.properties.scope = {type:'string',enum:['auto','page']};
+      }
       return copy;
     }), ...CONTROL_TOOLS];
     this.active = await this.context.newPage();
@@ -94,6 +110,7 @@ export class Runtime {
     const alias = this.nextPage++ === 0 ? 'page' : `page${this.nextPage-1}`;
     const info = {alias, page, opener: null};
     this.pages.set(page, info);
+    page.on('framenavigated', () => this.navigationVersion++);
     const entry = this.inflight?.mutating ? this.inflight : this.lastMutation;
     if (this.journal.active) {
       if (!entry) this.journal.problem = 'Page opened without a recordable originating action';
@@ -223,6 +240,10 @@ export class Runtime {
     return result;
   }
   async call(name, args = {}) {
+    if (name === 'browser_batch' || (name === 'browser_fill_form' && args.fields?.length > 1)) {
+      if (!this.journal.active) throw new Error('Start verified recording before browser actions');
+      return executeBatch(this, name === 'browser_batch' ? args : {actions:[{tool:name,arguments:args}]});
+    }
     if (name === 'poc_preflight') return this.preflight();
     if (name === 'poc_record_start') {
       if (!this.verified) throw new Error('ID-first fork preflight has not passed');
@@ -230,7 +251,7 @@ export class Runtime {
       this.hasRecorded = true;
       this.lastMutation = null;
       this.journal.start();
-      return {started:true};
+      return {started:true, metrics:this.metrics(), activePage:this.pages.get(this.active)?.alias, pages:this.pageState()};
     }
     if (name === 'poc_record_stop') {
       if (!this.journal.active) throw new Error('Recording not started');
@@ -239,6 +260,7 @@ export class Runtime {
       const code = this.guard.assertCode(this.journal.render(args.status, args.reason || ''));
       return {code, available:true, complete:!this.journal.problem, strategy:'fork-mcp-action-code', syntaxValidated:true,
         mcpToolCalls:this.mcpCalls,
+        metrics:this.metrics(),
         actionCount:this.journal.entries.filter(e => e.code).length, pages:this.pageState()};
     }
     if (!this.journal.active) throw new Error('Start verified recording before browser actions');
@@ -254,12 +276,15 @@ export class Runtime {
     const alias = this.pages.get(this.active)?.alias;
     if (!alias && name !== 'browser_new_page') throw new Error('No active page');
     const mutating = !READ.has(name) && name !== 'browser_assert';
+    const beforeScreen = mutating ? await screenStamp(this) : undefined;
     const entry = this.journal.begin(alias || 'page', name, mutating);
     this.inflight = entry;
     if (mutating) this.lastMutation = entry;
     let result;
     try {
-      if (name === 'browser_switch_page') {
+      if (name === 'browser_snapshot') {
+        result = await inspectSnapshot(this, args);
+      } else if (name === 'browser_switch_page') {
         const info = [...this.pages.values()].find(p => p.alias === args.page && !p.page.isClosed());
         if (!info) throw new Error('Unknown page alias');
         await this.select(info.page);
@@ -306,19 +331,22 @@ export class Runtime {
       const compact = {isError:result.isError, executed:!result.isError && (mutating || name === 'browser_assert'), mutating,
         result:result.result, error:result.error, snapshot:result.snapshot,
         modalState:result['modal state'], evidenceId:result.evidenceId, assertion:result.assertion,
-        activePage:this.pages.get(this.active)?.alias, pages:this.pageState()};
-      if (compact.snapshot && typeof compact.snapshot !== 'string') compact.snapshot = JSON.stringify(compact.snapshot);
-      if (compact.snapshot?.length > 8000) {
-        compact.snapshot = compact.snapshot.slice(0,8000);
-        compact.snapshotTruncated = true;
-        compact.hint = 'Snapshot truncated. Request a scoped snapshot using target and depth.';
-      }
+        activePage:this.pages.get(this.active)?.alias, pages:this.pageState(),
+        recoverable:result.recoverable, notices:result.notices, snapshotScope:result.snapshotScope,
+        snapshotFallback:result.snapshotFallback,
+        errorClass:result.isError?(result.errorClass || 'PlaywrightError'):undefined,
+        transition:mutating && (beforeScreen !== await screenStamp(this) || !beforeScreen ||
+          ['browser_click','browser_press_key','browser_handle_dialog'].includes(name)), metrics:this.metrics()};
+      Object.assign(compact, compactSnapshot(compact.snapshot));
+      if (compact.snapshotTruncated) compact.hint = 'Snapshot trimmed. Inspect a specific target or increase depth for omitted content.';
+      if (compact.isError) Object.assign(compact, this.guard.diagnostic({name:compact.errorClass,message:compact.error}, name, compact.activePage));
       return this.guard.object(compact);
     } catch (error) {
-      this.journal.problem ||= 'An action could not be recorded completely';
+      if (mutating) this.journal.problem ||= 'An action could not be recorded completely';
       throw error;
     } finally { this.inflight = null; }
   }
+  metrics() { return {mcpToolCalls:this.mcpCalls, snapshotCount:this.snapshotCount, snapshotFallbackCount:this.snapshotFallbackCount}; }
   async close() {
     await this.client?.close().catch(() => {});
     await this.upstream?.close().catch(() => {});

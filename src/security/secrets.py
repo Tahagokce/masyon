@@ -17,6 +17,10 @@ class Secrets:
         for secret in sorted(self.variants, key=len, reverse=True):
             value = value.replace(secret, "[REDACTED]")
         value = re.sub(r"(?i)(bearer\s+)[\w.~/+\-=]+", r"\1[REDACTED]", value)
+        value = re.sub(r"(?i)(https?://)[^\s/]+:[^\s/@]+@", r"\1[REDACTED]@", value)
+        value = re.sub(r"(?i)([?&][^=\s]*(?:token|secret|key|session|auth)[^=\s]*=)[^&#\s'\"]+", r"\1[REDACTED]", value)
+        value = re.sub(r'''(?i)(["']?(?:password|authorization|cookie|api[_-]?key|access[_-]?token|refresh[_-]?token|session[_-]?(?:id|secret))["']?\s*[:=]\s*)(["'])(.*?)\2''',
+                       r"\1\2[REDACTED]\2", value)
         value = re.sub(r"(?i)((?:token|api[_-]?key|password|authorization|cookie)\s*[=:]\s*)[^\s,;]+",
                        r"\1[REDACTED]", value)
         return value
@@ -32,3 +36,8 @@ class Secrets:
 
     def contains(self, text: str) -> bool:
         return any(value in text for value in self.variants)
+
+    def diagnostic(self, exc):
+        message = getattr(exc, "message", None) or str(exc)
+        message = re.split(r"\n(?:Call log:|\s+at |\s*\d+\))", message)[0]
+        return {"errorClass":type(exc).__name__, "error":self.clean(message)[:700]}

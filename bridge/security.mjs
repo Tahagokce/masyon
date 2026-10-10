@@ -7,8 +7,16 @@ export class SecretGuard {
   }
   clean(text) {
     for (const secret of [...this.variants].sort((a,b) => b.length-a.length)) text = text.split(secret).join('[REDACTED]');
-    return text.replace(/(bearer\s+)[\w.~/+=-]+/gi, '$1[REDACTED]')
+    return text.replace(/(https?:\/\/)[^\s/]+:[^\s/@]+@/gi, '$1[REDACTED]@')
+      .replace(/(bearer\s+)[\w.~/+=-]+/gi, '$1[REDACTED]')
+      .replace(/([?&](?:[^=\s]*(?:token|secret|key|session|auth)[^=\s]*)=)[^&#\s'"]+/gi, '$1[REDACTED]')
+      .replace(/(["']?(?:password|authorization|cookie|api[_-]?key|access[_-]?token|refresh[_-]?token|session[_-]?(?:id|secret))["']?\s*[:=]\s*)(["'])(.*?)\2/gi, '$1$2[REDACTED]$2')
       .replace(/((?:token|api[_-]?key|password|authorization|cookie)\s*[=:]\s*)[^\s,;]+/gi, '$1[REDACTED]');
+  }
+  diagnostic(error, tool, page) {
+    // Keep the actual first diagnostic, not raw stacks, DOM dumps or arguments.
+    const message = String(error?.message || error || 'Operation failed').split(/\n(?:Call log:|\s+at |\s*\d+\))/)[0];
+    return {tool, errorClass:error?.name || 'Error', error:this.clean(message).slice(0,700), activePage:page};
   }
   object(value) {
     if (typeof value === 'string') return this.clean(value);

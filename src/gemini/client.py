@@ -5,10 +5,11 @@ from .prompts import SYSTEM
 
 
 class GeminiClient:
-    def __init__(self, api_key: str, tools: list[dict], state):
+    def __init__(self, api_key: str, tools: list[dict], state, model: str):
         self.client = genai.Client(api_key=api_key, http_options=types.HttpOptions(
             timeout=90000, retry_options=types.HttpRetryOptions(attempts=1)))
         self.state = state
+        self.model = model
         declarations = [types.FunctionDeclaration(name=t["name"], description=t.get("description", ""),
                                                   parameters_json_schema=t["inputSchema"]) for t in tools]
         self.config = types.GenerateContentConfig(
@@ -19,7 +20,8 @@ class GeminiClient:
 
     async def request(self, contents):
         self.state.metrics["geminiRequests"] += 1
-        response = await self.client.aio.models.generate_content(model="gemini-2.5-flash", contents=contents, config=self.config)
+        self.state.metrics["contextCharactersSent"] += sum(len(c.model_dump_json()) for c in contents)
+        response = await self.client.aio.models.generate_content(model=self.model, contents=contents, config=self.config)
         usage = response.usage_metadata
         if usage:
             for key, field in (("inputTokens", "prompt_token_count"), ("outputTokens", "candidates_token_count"),

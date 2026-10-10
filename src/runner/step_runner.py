@@ -1,16 +1,11 @@
 import asyncio
 import json
-from dataclasses import asdict
-
 from google.genai import types
+from src.gemini.context import StepContext
 
 
 async def run_step(step, ai, browser, state, config, secrets, log):
-    payload = {"currentStep": asdict(step), "generatedValues": state.generated_values,
-               "previousState": state.summary, "pages": state.pages,
-               "baseUrl": config.base_url, "credentialNames": config.secret_names}
-    initial = types.Content(role="user", parts=[types.Part(text=json.dumps(secrets.object(payload)))])
-    exchanges = []
+    context = StepContext(step, config, secrets)
     evidence, actions, errors = {}, 0, False
     latest_mutation = 0
     sequence = 0
@@ -21,26 +16,24 @@ async def run_step(step, ai, browser, state, config, secrets, log):
                 "verification": "", "evidence": list(evidence.values())}
 
     async def loop():
-        nonlocal exchanges, calls, sequence, actions, errors, latest_mutation
+        nonlocal calls, sequence, actions, errors, latest_mutation
         while calls < config.max_step_calls:
-            # Complete request/response pairs preserve Gemini thought signatures.
-            # Older exchanges are dropped; only IDs, generated values and summary survive.
-            context = types.Content(role="user", parts=[types.Part(text=json.dumps({
-                "generatedValues": state.generated_values, "pages": state.pages,
-                "verificationEvidence": list(evidence.values())[-8:]}))])
-            recent = exchanges[-4:]
-            while len(recent) > 1 and sum(len(item.model_dump_json()) for pair in recent for item in pair) > 20000:
-                recent = recent[1:]
-            content = await ai.request([initial, context, *[item for pair in recent for item in pair]])
+            content = await ai.request(context.request(state, evidence))
             functions = [part.function_call for part in content.parts or [] if part.function_call]
             if not functions:
                 return failed("BLOCKED", "Gemini returned no tool calls")
             replies = []
+            checkpoint_required = False
             for function in functions:
                 calls += 1
                 if calls > config.max_step_calls:
                     return failed("BLOCKED", "Step tool-call limit reached")
                 name, args = function.name, dict(function.args or {})
+                if checkpoint_required:
+                    replies.append(types.Part(function_response=types.FunctionResponse(name=name, id=function.id,
+                        response={"executed":False,"checkpointRequired":True,
+                                  "reason":"Skipped after UI transition; inspect and replan before continuing."})))
+                    continue
                 if len(json.dumps(args)) > 8000:
                     return failed("BLOCKED", "Model tool arguments exceeded the context budget")
                 if name == "finish_step":
@@ -56,7 +49,8 @@ async def run_step(step, ai, browser, state, config, secrets, log):
                     if not valid:
                         result = {"isError": True, "reason": "Completion rejected: need successful operations and fresh expected-result assertion evidence; finish alone."}
                     else:
-                        state.summary = secrets.clean(str(args.get("stateSummary", "")))[:1200]
+                        state.summary = secrets.clean(str(args.get("stateSummary", "")))[:400]
+                        if status == "COMPLETED": state.completed_steps.append(step.stepNumber)
                         return secrets.object({"stepNumber": step.stepNumber, "status": status,
                             "reason": str(args["reason"])[:2000], "verification": str(args.get("verification", ""))[:2000],
                             "evidence": [evidence[i] for i in ids] if valid_ids else []})
@@ -71,32 +65,43 @@ async def run_step(step, ai, browser, state, config, secrets, log):
                         result = {"isError": True, "reason": str(exc)}
                 elif name in {t["name"] for t in browser.tools if not t["name"].startswith("poc_")}:
                     sequence += 1
-                    state.metrics["browserToolCalls"] += 1
                     log(f"[AI] Requested tool: {name}")
-                    result = await browser.call(name, args)
-                    state.pages = result.get("pages", state.pages)
+                    try:
+                        result = await browser.call(name, args)
+                    except Exception as exc:
+                        result = {"isError":True, **secrets.diagnostic(exc), "activePage":state.active_page}
+                    state.metrics["browserToolCalls"] += result.get("batchExecuted", 1)
+                    state.observe(result)
+                    for notice in result.get("notices") or []: log(notice)
                     if result.get("mutating"):
                         latest_mutation = sequence
                     if result.get("isError"):
-                        errors = True
+                        detail = secrets.object({"tool":result.get("failedTool",name), "errorClass":result.get("errorClass", "BrowserToolError"),
+                            "message":result.get("error", "operation did not succeed"),
+                            "activePage":state.active_page, "stepNumber":step.stepNumber})
+                        log(f"[MCP] {json.dumps(detail, ensure_ascii=False)}")
                         # A failed assertion is a failed expected result; never "recover" by
                         # asserting a different, easier condition and claiming success.
-                        log(f"[MCP] {name} failed")
-                        return failed("FAILED", f"Browser tool failed: {name}; {result.get('error', 'operation did not succeed')}")
+                        if not (name == "browser_snapshot" and result.get("recoverable")):
+                            errors = True
+                            return {**failed("FAILED", f"Browser tool failed: {name}; {detail['errorClass']}: {detail['message']}"),
+                                    "errorDetails":detail}
+                        log("[SNAPSHOT] Recoverable inspection error; continuing with a new inspection or known target")
                     actions += int(bool(result.get("executed")))
                     if result.get("evidenceId"):
                         item = {"id": result["evidenceId"], "sequence": sequence,
                                 "assertion": result.get("assertion"), "page": result.get("activePage")}
                         evidence[item["id"]] = item
                         log(f"[VERIFY] Browser assertion passed ({item['id']})")
-                    log(f"[MCP] {name} successful")
+                    if not result.get("isError"): log(f"[MCP] {name} successful")
+                    checkpoint_required = bool(result.get("transition") or result.get("checkpointRequired"))
                     result = {k: v for k, v in result.items() if k not in {"code", "recording"}}
                 else:
                     result = {"isError": True, "reason": "Tool is not available"}
-                result = secrets.object(result)
+                result = context.observe(name, args, secrets.object(result))
                 replies.append(types.Part(function_response=types.FunctionResponse(name=name, id=function.id, response=result)))
-            exchanges.append((content, types.Content(role="user", parts=replies)))
-            if sum(len(item.model_dump_json()) for item in exchanges[-1]) > 30000:
+            context.remember(content, replies)
+            if sum(len(item.model_dump_json()) for item in context.request(state, evidence)) > 30000:
                 return failed("BLOCKED", "Tool batch exceeded the context budget; no success inferred")
         return failed("BLOCKED", "Step tool-call limit reached")
 
@@ -105,3 +110,7 @@ async def run_step(step, ai, browser, state, config, secrets, log):
             return await loop()
     except TimeoutError:
         return failed("BLOCKED", "Step deadline exceeded; browser outcome may be uncertain")
+    except Exception as exc:
+        details = {**secrets.diagnostic(exc), "stepNumber":step.stepNumber, "activePage":state.active_page}
+        log("[ERROR] " + json.dumps(details, ensure_ascii=False))
+        return {**failed("BLOCKED", f"{details['errorClass']}: {details['error']}"), "errorDetails":details}

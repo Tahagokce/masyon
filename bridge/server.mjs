@@ -12,10 +12,10 @@ server.setRequestHandler(CallToolRequestSchema, request => {
     try {
       const result = runtime.guard.object(await runtime.call(request.params.name, request.params.arguments || {}));
       return {isError:Boolean(result.isError), content:[{type:'text',text:JSON.stringify(result)}]};
-    } catch {
-      // Raw exceptions may contain secrets, DOM values or authentication URLs.
+    } catch (error) {
       return {isError:true, content:[{type:'text',text:JSON.stringify({isError:true,
-        error:'Fork/MCP operation failed; check tool arguments, fork APIs and browser availability.'})}]};
+        ...runtime.guard.diagnostic(error, request.params.name, runtime.pages.get(runtime.active)?.alias),
+        pages:runtime.guard.object(runtime.pageState()), metrics:runtime.metrics()})}]};
     }
   });
   queue = task.catch(() => {});

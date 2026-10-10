@@ -14,6 +14,7 @@ class Config:
     max_step_calls: int
     step_timeout: int
     tool_timeout: int
+    gemini_model: str = "gemini-3.8-flash"
 
     @classmethod
     def from_env(cls):
@@ -29,4 +30,7 @@ class Config:
             ("MAX_STEP_CALLS", "30"), ("STEP_TIMEOUT_SECONDS", "300"), ("TOOL_TIMEOUT_SECONDS", "60"))]
         if any(n < 1 for n in numbers):
             raise ValueError("Call limits and timeouts must be positive")
-        return cls(command, os.environ.get("WBS_BASE_URL", ""), names, *numbers)
+        model = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash").strip()
+        if not model or not re.fullmatch(r"[a-zA-Z0-9._/-]+", model):
+            raise ValueError("GEMINI_MODEL must be a nonempty model identifier")
+        return cls(command, os.environ.get("WBS_BASE_URL", ""), names, *numbers, model)

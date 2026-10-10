@@ -10,8 +10,25 @@ class ExecutionState:
     generated_values: dict = field(default_factory=dict)
     summary: str = ""
     pages: list = field(default_factory=list)
+    active_page: str | None = None
+    completed_steps: list[int] = field(default_factory=list)
     metrics: dict = field(default_factory=lambda: {"geminiRequests": 0, "inputTokens": 0, "outputTokens": 0,
-                                                 "thoughtTokens": 0, "browserToolCalls": 0})
+                                                 "thoughtTokens": 0, "browserToolCalls": 0, "mcpToolCalls": 0,
+                                                 "snapshotCount": 0, "snapshotFallbackCount": 0,
+                                                 "contextCharactersSent": 0})
+
+    def compact(self):
+        return {"completedSteps":self.completed_steps.copy(), "activePage":self.active_page,
+                "currentUrl":next((p.get("url", "") for p in self.pages if p.get("alias") == self.active_page), ""),
+                "knownPages":[{k:p[k] for k in ("alias","url","opener","closed") if k in p} for p in self.pages],
+                "generatedValues":self.generated_values.copy(), "summary":self.summary[:400]}
+
+    def observe(self, result):
+        self.pages = result.get("pages", self.pages)
+        self.active_page = result.get("activePage", self.active_page)
+        for key in ("mcpToolCalls", "snapshotCount", "snapshotFallbackCount"):
+            if key in result.get("metrics", {}):
+                self.metrics[key] = result["metrics"][key]
 
     def generate(self, name: str, prefix: str = "AUTO", value: str | None = None) -> str:
         if not re.fullmatch(r"[a-zA-Z][a-zA-Z0-9_]{0,47}", name):

@@ -25,7 +25,7 @@ async def run_case(csv_path: Path, output: Path, jira_key=None):
     state = ExecutionState()
     report = {"jiraKey": case.jiraKey, "runId": state.run_id, "status": "BLOCKED", "steps": [],
               "generatedValues": state.generated_values, "metrics": state.metrics,
-              "recording": {"available": False}}
+              "recording": {"available": False}, "geminiModel":config.gemini_model}
 
     with open(folder / "run.log", "w", encoding="utf-8") as logfile:
         os.chmod(folder / "run.log", 0o600)
@@ -38,6 +38,7 @@ async def run_case(csv_path: Path, output: Path, jira_key=None):
             write_json(folder / "execution.json", report, secrets)
 
         checkpoint()
+        log(f"[CONFIG] Gemini model: {config.gemini_model}")
         try:
             if not os.environ.get("PLAYWRIGHT_FORK_PATH"):
                 raise ValueError("PLAYWRIGHT_FORK_PATH is required; standard Playwright fallback is forbidden")
@@ -50,14 +51,17 @@ async def run_case(csv_path: Path, output: Path, jira_key=None):
                     raise ValueError("Fork preflight failed: " + preflight.get("error", "ID-first code generation not verified"))
                 log("[MCP] Fork identity and ID-first codegen preflight passed")
                 recording = Recording(browser, folder, secrets)
-                await recording.start()
+                state.observe(await recording.start())
                 ai = None
                 try:
                     ai = GeminiClient(os.environ["GEMINI_API_KEY"],
-                                      [t for t in browser.tools if not t["name"].startswith("poc_")] + LOCAL_TOOLS, state)
+                                      [t for t in browser.tools if not t["name"].startswith("poc_")] + LOCAL_TOOLS,
+                                      state, config.gemini_model)
                     for step in case.steps:
                         log(f"[JIRA] Step {step.stepNumber}")
+                        before = state.metrics.copy()
                         result = await run_step(step, ai, browser, state, config, secrets, log)
+                        result["metrics"] = {key:state.metrics[key]-value for key,value in before.items()}
                         report["steps"].append(result)
                         log(f"[STEP {step.stepNumber}] {result['status']}")
                         checkpoint()
@@ -69,25 +73,29 @@ async def run_case(csv_path: Path, output: Path, jira_key=None):
                         report["status"] = "SUCCESS"
                 except BaseException as exc:
                     report["status"] = "BLOCKED"
-                    report["reason"] = f"Execution interrupted ({type(exc).__name__}); inspect configuration/connectivity"
+                    details = secrets.diagnostic(exc)
+                    report["reason"] = f"{details['errorClass']}: {details['error']}"
+                    report["errorDetails"] = details
                     raise
                 finally:
                     try:
                         report["recording"] = await recording.stop(report["status"], report.get("reason", ""))
                         state.metrics["mcpToolCalls"] = report["recording"].get("mcpToolCalls", 0)
+                        state.observe(report["recording"])
                         if not report["recording"].get("complete", False):
                             report["status"] = "BLOCKED"
                             report["reason"] = "Only a partial recording is available; see recording.spec.ts"
-                    except Exception:
+                    except Exception as exc:
                         report["status"] = "BLOCKED"
-                        report["reason"] = "Recording finalization failed; no successful POC can be claimed"
+                        report["recordingError"] = secrets.diagnostic(exc)
+                        report.setdefault("reason", "Recording finalization failed; no successful POC can be claimed")
                     if ai:
                         await ai.close()
         except (Exception, asyncio.CancelledError) as exc:
             report["status"] = "BLOCKED"
-            # Only our own validation errors are printable; SDK errors can contain secrets.
-            report.setdefault("reason", secrets.clean(str(exc)) if isinstance(exc, ValueError)
-                              else f"Integration unavailable ({type(exc).__name__}); check environment and fork compatibility")
+            details = secrets.diagnostic(exc)
+            report.setdefault("reason", f"{details['errorClass']}: {details['error']}")
+            report.setdefault("errorDetails", details)
             log("[RUN] " + report["reason"])
         finally:
             attempted = len(report["steps"])
@@ -97,6 +105,10 @@ async def run_case(csv_path: Path, output: Path, jira_key=None):
                         "status": "BLOCKED", "reason": report.get("reason", "Execution stopped"), "verification": ""})
             report["notRunSteps"] = [s.stepNumber for s in case.steps[len(report["steps"]):]]
             report["pages"] = state.pages
+            count = max(1, len([s for s in report["steps"] if "metrics" in s]))
+            state.metrics["averageGeminiRequestsPerStep"] = round(state.metrics["geminiRequests"] / count, 2)
+            state.metrics["averageInputTokensPerStep"] = round(state.metrics["inputTokens"] / count, 2)
+            report["compactState"] = state.compact()
             log("[METRICS] " + str(state.metrics))
             checkpoint()
     return report, folder

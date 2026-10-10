@@ -2,13 +2,15 @@
 
 Phase 1 implementation for sequential Jira CSV execution, browser verification,
 action-code recording and execution reports. Python orchestrates the official
-Google GenAI SDK (`gemini-2.5-flash`) and official MCP Python client. A small Node
+Google GenAI SDK (model from `GEMINI_MODEL`, default `gemini-3.8-flash`) and official MCP Python client. A small Node
 MCP bridge loads browser tools and selector generation directly from your built
 Playwright fork. No standard Playwright package is installed by this project.
 
-**Acceptance status:** local browser/MCP recording and replay have been tested.
-The real Gemini/application/Jira run and the user's ID-first fork remain unverified
-because those inputs were not supplied. See [test results](docs/TEST_RESULTS.md).
+**Acceptance status (2026-10-10):** the custom ID-first fork, local browser/MCP
+recording and replay pass. The real WBT-10891 run reached Gemini successfully but
+stopped on application DNS resolution at step 1. Live step-5 acceptance and token
+savings cannot be claimed. See [current results](docs/OPTIMIZATION_RESULTS.md) and
+[original validation](docs/TEST_RESULTS.md).
 The example CSV is a synthetic fixture, not a real Jira export.
 
 ## Local setup
@@ -38,6 +40,7 @@ the runner does not automatically read `.env` files.
 
 ```sh
 export PLAYWRIGHT_FORK_PATH=/absolute/path/to/your/built-playwright-fork
+export GEMINI_MODEL=gemini-3.8-flash
 export WBS_BASE_URL=https://your-test-application.example
 # Set GEMINI_API_KEY, WBS_USERNAME and WBS_PASSWORD securely in the environment.
 # Optional, when not using the fork's installed Chromium:
@@ -55,6 +58,11 @@ login steps. `WBS_BASE_URL` is needed only when the URL is not in the case.
 `SECRET_ENV_NAMES` defaults to `WBS_USERNAME,WBS_PASSWORD`; add any additional
 browser secrets there. Only names are sent to Gemini. Never add `GEMINI_API_KEY`
 to browser secret names.
+
+`GEMINI_MODEL` is read by configuration and passed to every SDK request. Only the
+configuration default is fixed; the request logic contains no model name. Startup
+logs `[CONFIG] Gemini model: ...`. Existing `.env` files are not modified or
+automatically loaded. Explicitly export the values or use your normal secret loader.
 
 `PLAYWRIGHT_MCP_COMMAND` optionally overrides the default
 `["node", "/absolute/path/to/this/project/bridge/server.mjs"]` as a JSON argv
@@ -93,7 +101,12 @@ An existing case directory is never overwritten. Choose a new `--output-dir` for
 reruns. Reports include attempted steps, unexecuted step numbers, generated values,
 page/opener relationships, fork path/version/hash and ID-first probe results,
 recording completeness, Gemini request/token counts, browser-facing tool counts,
-and underlying MCP calls. Failure recordings preserve available action code and
+and underlying MCP calls. Metrics also include `snapshotCount`,
+`snapshotFallbackCount`, averages per attempted step, and per-step deltas.
+`browserToolCalls` counts individual operations in batches; `mcpToolCalls` includes
+preflight and internal context/locator calls. `contextCharactersSent` measures
+serialized conversation size, not tokens, and excludes system/tool definitions.
+Failure recordings preserve available action code and
 end in an explicit failure. When no recording was obtained, the `.spec.ts` is an
 explicitly failing diagnostic marker, never a claimed successful recording.
 
@@ -141,19 +154,41 @@ the mechanical gate cannot prove natural-language business semantics.
 
 ## Context and secrets
 
-Only the current step, generated values, short previous-state summary, page aliases
-and recent complete tool exchanges are sent to Gemini. Routine action responses do
-not contain snapshots. Explicit snapshots are capped at 8,000 characters with a
-visible truncation indicator; scoped snapshots are available. History has four
-exchange pairs and a 20,000-character pruning target; oversized individual batches
-stop at 30,000 characters. Tool-call count and step deadlines prevent infinite loops.
+Every Jira step creates a fresh `StepContext`. Completed steps leave only their
+numbers, generated values, known pages/opener/closed state, active page/current URL
+and a summary of at most 400 characters. No previous step's detailed history or
+snapshot is sent. Within a step, only the latest complete model/tool exchange is
+kept, preserving thought signatures verbatim. Snapshot data is removed from tool
+history and stored once as `latestInspection`; a new snapshot replaces it and a
+mutation clears it. At most eight compact operation receipts are retained.
+
+Snapshots prefer the last visible `[role="dialog"]`, then visible Ant Design and
+generic modal containers, then the page. Explicit scopes are checked for unique
+visible matches. A scoped failure falls back to a whole-page snapshot and logs
+`[SNAPSHOT] Falling back to whole-page snapshot`. A still-unavailable inspection
+returns a recoverable error if the browser/page is usable. It does not count as
+assertion evidence or fail a business step by itself. Use `scope=page` to inspect
+outside a modal. Default depth is 5; scoped/deeper requests remain available.
+Snapshot trees are trimmed to about 4,000 characters as valid JSON with a visible
+truncation flag; text, references and relevant element state are preserved.
+
+Use `browser_batch` for 1–5 known fill/select/click/key operations on one stable
+screen. Native multi-field `browser_fill_form` uses the same per-field guard.
+Every action still runs and records through MCP. Navigation/reload, new pages,
+modal/dialog changes, visible text/control changes and validation changes require
+a model checkpoint. Click, key and submit operations always end a batch, even
+before asynchronous changes appear. Remaining actions are explicitly unexecuted.
+Multiple function calls from one model response obey the same checkpoints.
+Oversized context stops at 30,000 characters; step deadlines and call budgets remain.
 
 Browser fill tools receive environment variable **names**. MCP resolves them in
 memory and generates `process.env['WBS_PASSWORD']!`, etc. Known secrets and common
 encodings are scrubbed from browser results and persisted outputs. Code containing
 secrets/redaction markers is rejected, rather than exported as a broken replay.
 Logs contain tool names/statuses and generated values, not model transcripts,
-arguments, snapshots or raw exception messages. Console persistence and incidental
+arguments, snapshots or raw exception stacks. Failures include tool name, error
+class, a redacted concise actual message, page alias and Jira step number.
+Console persistence and incidental
 MCP file output are disabled. No screenshot, trace, video or storage-state tools
 are exposed. Gemini's API key is never forwarded to the browser child process.
 
@@ -167,6 +202,10 @@ content intended for Gemini.
 ```sh
 .venv/bin/python -m unittest discover -s tests -v
 npm test
+# Enable real modal/batch tests (otherwise these are explicitly skipped):
+PLAYWRIGHT_FORK_PATH=/path/to/built/fork npm test
+# Payload-size benchmark; this does not measure live Gemini tokens:
+PYTHONPATH=. .venv/bin/python tests/measure_context.py
 
 # Real fork + real browser/MCP integration; no Gemini call:
 PLAYWRIGHT_FORK_PATH=/path/to/built/fork node tests/live_contract.mjs
@@ -182,8 +221,14 @@ it cannot make a production run bypass preflight and is not POC acceptance.
 
 Known limits:
 
-* No real Gemini/application acceptance run without the supplied inputs. Unit
-  protocol test doubles are labeled as such and never used by the runner.
+* The 2026-10-10 real application run stopped on DNS resolution. The five-step
+  baseline cannot be compared with this one-request failure. Unit protocol test
+  doubles are labeled as such and never used by the runner.
+* Last-visible-dialog order uses DOM order; applications that stack dialogs in a
+  different order can supply an explicit visible target. Scope races fall back.
+* Batch guards are conservative. They inspect state after each completed operation;
+  delayed changes can still occur after a checkpoint. Click/key/submit always stops.
+* Aggressive snapshot trimming may require a narrower or deeper follow-up inspection.
 * Fork adapter uses version-dependent MCP/private APIs. Unsupported builds stop.
 * One isolated Chromium session and one recording per run. MFA/CAPTCHA or unclear
   business actions require BLOCKED. No file upload/download workflows in Phase 1.

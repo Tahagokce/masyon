@@ -23,6 +23,7 @@ class Recording:
         result = await self.browser.call("poc_record_start", {})
         if result.get("isError"):
             raise RuntimeError("Cannot start verified MCP action recording")
+        return result
 
     async def stop(self, status, reason):
         result = await self.browser.call("poc_record_stop", {"status": status, "reason": self.secrets.clean(reason)})
