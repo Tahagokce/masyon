@@ -9,7 +9,7 @@ import { Journal } from './recording.mjs';
 import { SecretGuard } from './security.mjs';
 import { inspectSnapshot, compactSnapshot } from './snapshot.mjs';
 import { executeBatch, screenStamp, BATCH_TOOLS } from './batch.mjs';
-import { staleRef, descriptor, rememberSnapshotRefs, resolveAssertionTarget } from './assertion-recovery.mjs';
+import { staleRef, descriptor, hasUsableDescriptor, rememberSnapshotRefs, resolveAssertionTarget } from './assertion-recovery.mjs';
 
 const require = createRequire(import.meta.url);
 const ALLOWED = new Set(['browser_navigate', 'browser_navigate_back', 'browser_navigate_forward',
@@ -212,6 +212,8 @@ export class Runtime {
     const pageAlias = this.pages.get(this.active)?.alias;
     let semantic = {...(this.refDescriptors.get(`${pageAlias}:${args.target}`) || {}),
       ...descriptor(args.targetDescriptor)};
+    if (args.kind !== 'url' && !args.target && !hasUsableDescriptor(semantic))
+      throw new Error('Assertion requires target or targetDescriptor');
     const attempt = async target => {
       let expression = '';
       if (args.kind !== 'url') {
@@ -243,6 +245,29 @@ export class Runtime {
       return result;
     };
     let target = args.target;
+    const notices = [];
+    if (args.kind !== 'url' && !target) {
+      notices.push('[ASSERT] Resolving targetDescriptor on active page');
+      let resolved;
+      if (semantic.id || semantic.selector) {
+        try { resolved = await resolveAssertionTarget(this.active, null, semantic); }
+        catch { resolved = null; }
+      }
+      if (!resolved) {
+        let fresh;
+        try { fresh = await inspectSnapshot(this, {scope:'page', depth:12}); }
+        catch { fresh = {isError:true}; }
+        if (fresh.isError || !fresh.snapshot) return {isError:true, errorClass:'AssertionTargetError',
+          error:'Current page snapshot unavailable for targetDescriptor', notices};
+        try { resolved = await resolveAssertionTarget(this.active, fresh.snapshot, semantic); }
+        catch { resolved = null; }
+      }
+      if (!resolved) return {isError:true, errorClass:'AssertionTargetError',
+        error:'targetDescriptor could not be resolved uniquely on the active page', notices};
+      target = resolved.target;
+      semantic = resolved.targetDescriptor;
+      notices.push(`[ASSERT] Resolved target to ${target}`);
+    }
     let result;
     try { result = await attempt(target); }
     catch (error) {
@@ -251,7 +276,7 @@ export class Runtime {
     }
     const stale = staleRef(result);
     if (stale && args.kind !== 'url') {
-      const notices = [`[ASSERT] Snapshot ref ${stale} is stale`, '[ASSERT] Capturing fresh snapshot'];
+      notices.push(`[ASSERT] Snapshot ref ${stale} is stale`, '[ASSERT] Capturing fresh snapshot');
       let fresh;
       try { fresh = await inspectSnapshot(this, {scope:'page', depth:12}); }
       catch { fresh = {isError:true}; }
@@ -267,8 +292,8 @@ export class Runtime {
       notices.push(`[ASSERT] Re-resolved target to ${target}`, '[ASSERT] Retrying assertion');
       try { result = await attempt(target); }
       catch (error) { result = {isError:true, error:error.message, errorClass:error.name}; }
-      result.notices = [...notices, ...(result.notices || [])];
     }
+    if (notices.length) result.notices = [...notices, ...(result.notices || [])];
     if (!result.isError) {
       result.evidenceId = `assertion-${++this.evidence}`;
       result.assertion = {kind:args.kind, target, expected:args.expected,

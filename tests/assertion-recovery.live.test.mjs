@@ -89,3 +89,49 @@ live('valid ref assertion does not capture another snapshot', async () => {
   assert.equal(runtime.snapshotCount,before);
   assert.equal(result.notices,undefined);
 });
+
+live('targetDescriptor alone resolves the SL Codes tab', async () => {
+  await runtime.active.setContent('<button role="tab" aria-label="SL Codes">SL Codes</button>');
+  const before = runtime.snapshotCount;
+  const result = await runtime.call('browser_assert',{
+    kind:'visible',targetDescriptor:{role:'tab',name:'SL Codes'}});
+  assert.equal(result.isError,false,JSON.stringify(result));
+  assert.equal(runtime.snapshotCount,before+1);
+  assert.equal(result.assertion.targetDescriptor.role,'tab');
+  assert.ok(result.assertion.target);
+  assert.ok(result.evidenceId);
+});
+
+live('targetDescriptor alone resolves the SL Codes tabpanel', async () => {
+  await runtime.active.setContent('<section role="tabpanel" aria-label="SL Codes">Codes table</section>');
+  const result = await runtime.call('browser_assert',{
+    kind:'visible',targetDescriptor:{role:'tabpanel',name:'SL Codes'}});
+  assert.equal(result.isError,false,JSON.stringify(result));
+  assert.equal(result.assertion.targetDescriptor.role,'tabpanel');
+  assert.ok(result.evidenceId);
+});
+
+live('valid ref with descriptor keeps the ref and does not inspect again', async () => {
+  const ref = await tabSnapshot();
+  const before = runtime.snapshotCount;
+  const result = await runtime.call('browser_assert',{
+    kind:'visible',target:ref,targetDescriptor:{role:'tabpanel',name:'SL Codes'}});
+  assert.equal(result.isError,false,JSON.stringify(result));
+  assert.equal(result.assertion.target,ref);
+  assert.equal(runtime.snapshotCount,before);
+});
+
+live('missing target and descriptor has a clear validation error', async () => {
+  await assert.rejects(() => runtime.call('browser_assert',{kind:'visible'}),
+    /Assertion requires target or targetDescriptor/);
+});
+
+live('unresolvable descriptor fails cleanly without assertion evidence', async () => {
+  await runtime.active.setContent('<button role="tab" aria-label="Other">Other</button>');
+  const result = await runtime.call('browser_assert',{
+    kind:'visible',targetDescriptor:{role:'tab',name:'SL Codes'}});
+  assert.equal(result.isError,true);
+  assert.equal(result.errorClass,'AssertionTargetError');
+  assert.match(result.error,/could not be resolved uniquely/);
+  assert.equal(result.evidenceId,undefined);
+});

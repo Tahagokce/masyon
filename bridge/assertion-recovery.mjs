@@ -13,6 +13,11 @@ export function descriptor(value) {
     .map(key => [key, value[key].slice(0, 240)]));
 }
 
+export function hasUsableDescriptor(value) {
+  const data = descriptor(value);
+  return Boolean(data.id || data.selector || data.label || data.text || data.role);
+}
+
 export function snapshotNodes(snapshot) {
   if (typeof snapshot === 'string') {
     try { snapshot = JSON.parse(snapshot); } catch { return []; }
