@@ -82,6 +82,9 @@ async def run_step(step, ai, browser, state, config, secrets, log):
                         log(f"[MCP] {json.dumps(detail, ensure_ascii=False)}")
                         # A failed assertion is a failed expected result; never "recover" by
                         # asserting a different, easier condition and claiming success.
+                        if name == "browser_assert" and result.get("recoveryIncomplete"):
+                            return {**failed("BLOCKED", f"Assertion target recovery incomplete: {detail['message']}"),
+                                    "errorDetails":detail}
                         if not (name == "browser_snapshot" and result.get("recoverable")):
                             errors = True
                             return {**failed("FAILED", f"Browser tool failed: {name}; {detail['errorClass']}: {detail['message']}"),

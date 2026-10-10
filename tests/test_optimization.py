@@ -109,4 +109,11 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['status'],'FAILED'); self.assertEqual(result['errorDetails']['stepNumber'],5)
         self.assertEqual(result['errorDetails']['activePage'],'page1')
 
+    async def test_unresolved_stale_ref_blocks_without_claiming_assertion_failure(self):
+        result,_,_,_=await self.execute([model(fc('browser_assert',{}))],
+            [{'isError':True,'recoveryIncomplete':True,'error':'Target could not be resolved uniquely in fresh page snapshot',
+              'errorClass':'AssertionRecoveryError','activePage':'page1'}])
+        self.assertEqual(result['status'],'BLOCKED')
+        self.assertEqual(result['errorDetails']['stepNumber'],5)
+
 if __name__=='__main__': unittest.main()

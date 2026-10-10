@@ -9,6 +9,7 @@ import { Journal } from './recording.mjs';
 import { SecretGuard } from './security.mjs';
 import { inspectSnapshot, compactSnapshot } from './snapshot.mjs';
 import { executeBatch, screenStamp, BATCH_TOOLS } from './batch.mjs';
+import { staleRef, descriptor, rememberSnapshotRefs, resolveAssertionTarget } from './assertion-recovery.mjs';
 
 const require = createRequire(import.meta.url);
 const ALLOWED = new Set(['browser_navigate', 'browser_navigate_back', 'browser_navigate_forward',
@@ -36,7 +37,8 @@ export const CONTROL_TOOLS = [
   schema('browser_close_page', 'Close the current browser tab.'),
   schema('browser_assert', 'Verify UI after the action. Uses actual browser state, retries for 5s and records the assertion. target is an observed snapshot reference or selector. For URL checks, omit target.',
     {kind: {type: 'string', enum: ['visible','hidden','text','value','enabled','disabled','checked','unchecked','url']},
-     target: str, expected: str}, ['kind']),
+     target: str, expected: str, targetDescriptor: {type:'object', properties:{
+       id:str, role:str, name:str, label:str, text:str, selector:str}, additionalProperties:false}}, ['kind']),
 ];
 
 export function loadFork(input) {
@@ -70,6 +72,7 @@ export class Runtime {
     this.snapshotCount = 0;
     this.snapshotFallbackCount = 0;
     this.navigationVersion = 0;
+    this.refDescriptors = new Map();
   }
   async initialize() {
     const launch = {headless: process.env.HEADLESS !== 'false'};
@@ -206,36 +209,70 @@ export class Runtime {
   async assertion(args) {
     const kinds = new Set(['visible','hidden','text','value','enabled','disabled','checked','unchecked','url']);
     if (!kinds.has(args.kind)) throw new Error('Unsupported assertion kind');
-    let expression = '';
-    if (args.kind !== 'url') {
-      if (!args.target) throw new Error('Assertion requires target');
-      const generated = await this.raw('browser_generate_locator', {target:args.target});
-      if (generated.isError) return generated;
-      expression = generated.result;
-      if (!expression || !/^(page\.)?(locator|getBy|frameLocator)/.test(expression)) throw new Error('Fork locator generation contract differs');
-      if (!expression.startsWith('page.')) expression = 'page.' + expression;
+    const pageAlias = this.pages.get(this.active)?.alias;
+    let semantic = {...(this.refDescriptors.get(`${pageAlias}:${args.target}`) || {}),
+      ...descriptor(args.targetDescriptor)};
+    const attempt = async target => {
+      let expression = '';
+      if (args.kind !== 'url') {
+        if (!target) throw new Error('Assertion requires target');
+        const generated = await this.raw('browser_generate_locator', {target});
+        if (generated.isError) return generated;
+        expression = generated.result;
+        if (!expression || !/^(page\.)?(locator|getBy|frameLocator)/.test(expression)) throw new Error('Fork locator generation contract differs');
+        if (!expression.startsWith('page.')) expression = 'page.' + expression;
+      }
+      if (['text','value','url'].includes(args.kind) && typeof args.expected !== 'string') throw new Error('Assertion needs expected string');
+      const expected = JSON.stringify(args.expected ?? '');
+      const checks = {visible:'await target.isVisible()', hidden:'!(await target.isVisible())',
+        enabled:'await target.isEnabled()', disabled:'!(await target.isEnabled())',
+        checked:'await target.isChecked()', unchecked:'!(await target.isChecked())',
+        text:`(await target.innerText()).includes(${expected})`, value:`(await target.inputValue()) === ${expected}`,
+        url:`page.url() === ${expected}`};
+      const body = `${expression ? `const target = ${expression};` : ''}
+        const deadline = Date.now() + 5000;
+        while (true) {
+          if (${checks[args.kind]}) return {verified: true};
+          if (Date.now() >= deadline) throw new Error('Expected result assertion failed');
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }`;
+      const result = await this.raw(this.runCodeName, {code:`async (page) => { ${body} }`});
+      let verified = false;
+      try { verified = JSON.parse(result.result || '{}').verified === true; } catch {}
+      if (!verified) result.isError = true;
+      return result;
+    };
+    let target = args.target;
+    let result;
+    try { result = await attempt(target); }
+    catch (error) {
+      if (!staleRef(error)) throw error;
+      result = {isError:true, error:error.message, errorClass:error.name};
     }
-    if (['text','value','url'].includes(args.kind) && typeof args.expected !== 'string') throw new Error('Assertion needs expected string');
-    const expected = JSON.stringify(args.expected ?? '');
-    const checks = {visible:'await target.isVisible()', hidden:'!(await target.isVisible())',
-      enabled:'await target.isEnabled()', disabled:'!(await target.isEnabled())',
-      checked:'await target.isChecked()', unchecked:'!(await target.isChecked())',
-      text:`(await target.innerText()).includes(${expected})`, value:`(await target.inputValue()) === ${expected}`,
-      url:`page.url() === ${expected}`};
-    const body = `${expression ? `const target = ${expression};` : ''}
-      const deadline = Date.now() + 5000;
-      while (true) {
-        if (${checks[args.kind]}) return {verified: true};
-        if (Date.now() >= deadline) throw new Error('Expected result assertion failed');
-        await new Promise(resolve => setTimeout(resolve, 100));
-      }`;
-    const result = await this.raw(this.runCodeName, {code:`async (page) => { ${body} }`});
-    let verified = false;
-    try { verified = JSON.parse(result.result || '{}').verified === true; } catch {}
-    if (!verified) result.isError = true;
+    const stale = staleRef(result);
+    if (stale && args.kind !== 'url') {
+      const notices = [`[ASSERT] Snapshot ref ${stale} is stale`, '[ASSERT] Capturing fresh snapshot'];
+      let fresh;
+      try { fresh = await inspectSnapshot(this, {scope:'page', depth:12}); }
+      catch { fresh = {isError:true}; }
+      if (fresh.isError || !fresh.snapshot) return {isError:true, recoveryIncomplete:true,
+        error:'Fresh page snapshot unavailable for stale assertion ref', errorClass:'AssertionRecoveryError', notices};
+      let resolved;
+      try { resolved = await resolveAssertionTarget(this.active, fresh.snapshot, semantic); }
+      catch { resolved = null; }
+      if (!resolved) return {isError:true, recoveryIncomplete:true,
+        error:'Target could not be resolved uniquely in fresh page snapshot', errorClass:'AssertionRecoveryError', notices};
+      target = resolved.target;
+      semantic = resolved.targetDescriptor;
+      notices.push(`[ASSERT] Re-resolved target to ${target}`, '[ASSERT] Retrying assertion');
+      try { result = await attempt(target); }
+      catch (error) { result = {isError:true, error:error.message, errorClass:error.name}; }
+      result.notices = [...notices, ...(result.notices || [])];
+    }
     if (!result.isError) {
       result.evidenceId = `assertion-${++this.evidence}`;
-      result.assertion = {kind:args.kind, target:args.target, expected:args.expected};
+      result.assertion = {kind:args.kind, target, expected:args.expected,
+        ...(Object.keys(semantic).length ? {targetDescriptor:semantic} : {})};
     }
     return result;
   }
@@ -328,11 +365,14 @@ export class Runtime {
       if (!result.isError && mutating && !code && !['browser_switch_page','browser_handle_dialog'].includes(name))
         throw new Error('Action succeeded without generated code; recording is incomplete');
       await this.synchronize();
+      if (result.snapshot) rememberSnapshotRefs(this.refDescriptors,
+        this.pages.get(this.active)?.alias, result.snapshot);
       const compact = {isError:result.isError, executed:!result.isError && (mutating || name === 'browser_assert'), mutating,
         result:result.result, error:result.error, snapshot:result.snapshot,
         modalState:result['modal state'], evidenceId:result.evidenceId, assertion:result.assertion,
         activePage:this.pages.get(this.active)?.alias, pages:this.pageState(),
-        recoverable:result.recoverable, notices:result.notices, snapshotScope:result.snapshotScope,
+        recoverable:result.recoverable, recoveryIncomplete:result.recoveryIncomplete,
+        notices:result.notices, snapshotScope:result.snapshotScope,
         snapshotFallback:result.snapshotFallback,
         errorClass:result.isError?(result.errorClass || 'PlaywrightError'):undefined,
         transition:mutating && (beforeScreen !== await screenStamp(this) || !beforeScreen ||
