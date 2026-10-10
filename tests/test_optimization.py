@@ -47,6 +47,13 @@ class ContextTests(unittest.TestCase):
         ctx.observe('browser_snapshot',{}, {'isError':True,'recoverable':True})
         self.assertNotIn('STALE_BEFORE_ERROR',dump(ctx.request(state,{})))
 
+    def test_unchanged_snapshot_keeps_last_inspection_once(self):
+        ctx=StepContext(Step(3,'Open SL Codes'),config(),Secrets([]))
+        ctx.observe('browser_snapshot',{}, {'snapshot':'SL_CODES_PANEL'})
+        response=ctx.observe('browser_snapshot',{}, {'unchanged':True,'reason':'UNCHANGED'})
+        self.assertTrue(response['unchanged'])
+        self.assertEqual(dump(ctx.request(ExecutionState(),{})).count('SL_CODES_PANEL'),1)
+
     def test_new_step_preserves_compact_state_not_old_case_or_history(self):
         state=ExecutionState(generated_values={'slCode':'AUTO_1'},completed_steps=[1],active_page='page1',
             pages=[{'alias':'page','url':'https://a','closed':False},
@@ -115,5 +122,17 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
               'errorClass':'AssertionRecoveryError','activePage':'page1'}])
         self.assertEqual(result['status'],'BLOCKED')
         self.assertEqual(result['errorDetails']['stepNumber'],5)
+
+    async def test_repeated_unchanged_inspection_stops_before_tool_limit(self):
+        result,calls,logs,transition=await self.execute([
+            model(fc('browser_snapshot',{})),model(fc('browser_snapshot',{})),
+            model(fc('browser_snapshot',{}))],
+            [{'snapshot':'Current fields','activePage':'page1'},
+             {'unchanged':True,'reason':'UNCHANGED: no browser state change','activePage':'page1'},
+             {'unchanged':True,'reason':'UNCHANGED: no browser state change','activePage':'page1'}])
+        self.assertEqual(result['status'],'BLOCKED')
+        self.assertEqual(calls,['browser_snapshot']*3)
+        self.assertIn('Expected result not verified',result['reason'])
+        self.assertNotIn('tool-call limit',result['reason'])
 
 if __name__=='__main__': unittest.main()

@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test tests/bridge.test.mjs tests/snapshot.test.mjs tests/modal.live.test.mjs tests/assertion-recovery.live.test.mjs"
+    "test": "node --test tests/bridge.test.mjs tests/snapshot.test.mjs tests/modal.live.test.mjs tests/assertion-recovery.live.test.mjs tests/orchestration.live.test.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.32.1",

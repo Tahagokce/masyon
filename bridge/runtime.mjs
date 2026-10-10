@@ -30,6 +30,8 @@ export const CONTROL_TOOLS = [
       }}},required:['tool','arguments']}}}, ['actions']),
   schema('poc_preflight', 'Verify fork provenance and actual ID-first MCP code generation.'),
   schema('poc_record_start', 'Start actual MCP action recording after successful fork preflight.'),
+  schema('poc_step_start', 'Set the active page and snapshot budget for one Jira step.',
+    {stepNumber:{type:'integer'}}, ['stepNumber']),
   schema('poc_record_stop', 'Stop recording and export a TypeScript test.',
     {status: {type: 'string', enum: ['SUCCESS','FAILED','BLOCKED']}, reason: str}, ['status']),
   schema('browser_switch_page', 'Select a known stable page alias from the returned pages.', {page: str}, ['page']),
@@ -72,6 +74,8 @@ export class Runtime {
     this.snapshotCount = 0;
     this.snapshotFallbackCount = 0;
     this.navigationVersion = 0;
+    this.topologyVersion = 0;
+    this.step = null;
     this.refDescriptors = new Map();
   }
   async initialize() {
@@ -113,7 +117,12 @@ export class Runtime {
     const alias = this.nextPage++ === 0 ? 'page' : `page${this.nextPage-1}`;
     const info = {alias, page, opener: null};
     this.pages.set(page, info);
-    page.on('framenavigated', () => this.navigationVersion++);
+    this.topologyVersion++;
+    page.on('close', () => this.topologyVersion++);
+    page.on('framenavigated', frame => {
+      this.navigationVersion++;
+      if (frame === page.mainFrame()) this.topologyVersion++;
+    });
     const entry = this.inflight?.mutating ? this.inflight : this.lastMutation;
     if (this.journal.active) {
       if (!entry) this.journal.problem = 'Page opened without a recordable originating action';
@@ -315,6 +324,15 @@ export class Runtime {
       this.journal.start();
       return {started:true, metrics:this.metrics(), activePage:this.pages.get(this.active)?.alias, pages:this.pageState()};
     }
+    if (name === 'poc_step_start') {
+      if (!this.journal.active) throw new Error('Start verified recording before Jira steps');
+      if (!Number.isInteger(args.stepNumber)) throw new Error('Jira step number is required');
+      await this.synchronize();
+      this.step = {number:args.stepNumber, lockedPage:this.pages.get(this.active)?.alias,
+        switchVersion:this.topologyVersion, revision:0, snapshotRevision:null,
+        snapshotTopology:null, snapshotPage:null};
+      return {activePage:this.step.lockedPage, pages:this.pageState(), metrics:this.metrics()};
+    }
     if (name === 'poc_record_stop') {
       if (!this.journal.active) throw new Error('Recording not started');
       await this.synchronize();
@@ -337,6 +355,16 @@ export class Runtime {
     await this.synchronize();
     const alias = this.pages.get(this.active)?.alias;
     if (!alias && name !== 'browser_new_page') throw new Error('No active page');
+    if (name === 'browser_snapshot' && this.step && this.step.snapshotRevision === this.step.revision &&
+        this.step.snapshotTopology === this.topologyVersion && this.step.snapshotPage === alias) {
+      return {isError:false, unchanged:true, reason:'UNCHANGED: The active page and browser state have not changed. Use the existing inspection to assert, take a meaningful action, or finish BLOCKED.',
+        activePage:alias, pages:this.pageState(), metrics:this.metrics()};
+    }
+    if (name === 'browser_switch_page' && this.step &&
+        (args.page === alias || this.topologyVersion <= this.step.switchVersion)) {
+      return {isError:false, denied:true, reason:`PAGE_LOCKED: ${alias} remains active for Jira step ${this.step.number}; no new page or navigation requires a switch. Assert on this page or finish BLOCKED.`,
+        activePage:alias, pages:this.pageState(), metrics:this.metrics()};
+    }
     const mutating = !READ.has(name) && name !== 'browser_assert';
     const beforeScreen = mutating ? await screenStamp(this) : undefined;
     const entry = this.journal.begin(alias || 'page', name, mutating);
@@ -390,6 +418,18 @@ export class Runtime {
       if (!result.isError && mutating && !code && !['browser_switch_page','browser_handle_dialog'].includes(name))
         throw new Error('Action succeeded without generated code; recording is incomplete');
       await this.synchronize();
+      if (this.step && !result.isError) {
+        if (mutating) this.step.revision++;
+        if (name === 'browser_snapshot') {
+          this.step.snapshotRevision = this.step.revision;
+          this.step.snapshotTopology = this.topologyVersion;
+          this.step.snapshotPage = this.pages.get(this.active)?.alias;
+        }
+        if (name === 'browser_switch_page') {
+          this.step.lockedPage = this.pages.get(this.active)?.alias;
+          this.step.switchVersion = this.topologyVersion;
+        }
+      }
       if (result.snapshot) rememberSnapshotRefs(this.refDescriptors,
         this.pages.get(this.active)?.alias, result.snapshot);
       const compact = {isError:result.isError, executed:!result.isError && (mutating || name === 'browser_assert'), mutating,

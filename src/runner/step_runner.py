@@ -10,13 +10,23 @@ async def run_step(step, ai, browser, state, config, secrets, log):
     latest_mutation = 0
     sequence = 0
     calls = 0
+    no_progress = 0
 
     def failed(status, reason):
         return {"stepNumber": step.stepNumber, "status": status, "reason": reason,
                 "verification": "", "evidence": list(evidence.values())}
 
+    if any(tool["name"] == "poc_step_start" for tool in browser.tools):
+        try:
+            started = await browser.call("poc_step_start", {"stepNumber": step.stepNumber})
+        except Exception as exc:
+            return failed("BLOCKED", "Jira step page lock could not start: " + secrets.diagnostic(exc)["error"])
+        if started.get("isError"):
+            return failed("BLOCKED", "Jira step page lock could not start: " + started.get("error", "unknown error"))
+        state.observe(started)
+
     async def loop():
-        nonlocal calls, sequence, actions, errors, latest_mutation
+        nonlocal calls, sequence, actions, errors, latest_mutation, no_progress
         while calls < config.max_step_calls:
             content = await ai.request(context.request(state, evidence))
             functions = [part.function_call for part in content.parts or [] if part.function_call]
@@ -73,6 +83,14 @@ async def run_step(step, ai, browser, state, config, secrets, log):
                     state.metrics["browserToolCalls"] += result.get("batchExecuted", 1)
                     state.observe(result)
                     for notice in result.get("notices") or []: log(notice)
+                    if result.get("unchanged") or result.get("denied"):
+                        no_progress += 1
+                        log(f"[ORCHESTRATION] {result.get('reason', 'Browser state unchanged')}")
+                        if no_progress >= 2:
+                            return failed("BLOCKED", "Expected result not verified: " + (step.expectedResult or "current UI")[:240] +
+                                          "; repeated unchanged snapshots or page switches without a browser state change")
+                    elif result.get("mutating") or result.get("evidenceId"):
+                        no_progress = 0
                     if result.get("mutating"):
                         latest_mutation = sequence
                     if result.get("isError"):
@@ -96,7 +114,8 @@ async def run_step(step, ai, browser, state, config, secrets, log):
                                 "assertion": result.get("assertion"), "page": result.get("activePage")}
                         evidence[item["id"]] = item
                         log(f"[VERIFY] Browser assertion passed ({item['id']})")
-                    if not result.get("isError"): log(f"[MCP] {name} successful")
+                    if not result.get("isError") and not (result.get("unchanged") or result.get("denied")):
+                        log(f"[MCP] {name} successful")
                     checkpoint_required = bool(result.get("transition") or result.get("checkpointRequired"))
                     result = {k: v for k, v in result.items() if k not in {"code", "recording"}}
                 else:

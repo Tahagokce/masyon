@@ -27,7 +27,7 @@ class BrowserClient:
             await asyncio.wait_for(self.session.initialize(), timeout=self.config.tool_timeout)
             listed = await self.session.list_tools()
             self.tools = [t.model_dump(by_alias=True, exclude_none=True) for t in listed.tools]
-            required = {"poc_preflight", "poc_record_start", "poc_record_stop", "browser_assert"}
+            required = {"poc_preflight", "poc_record_start", "poc_step_start", "poc_record_stop", "browser_assert"}
             if not required <= {t["name"] for t in self.tools}:
                 raise RuntimeError("MCP command must start the fork-aware POC bridge, not a bare MCP server")
             return self
