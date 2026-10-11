@@ -34,6 +34,13 @@ class ModelTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ,{},clear=True): self.assertEqual(Config.from_env().gemini_model,'gemini-3.8-flash')
 
 class ContextTests(unittest.TestCase):
+    def test_semantic_resolution_candidates_reach_planner_without_a_snapshot(self):
+        ctx=StepContext(Step(1,'Choose'),config(),Secrets([]))
+        reply=ctx.observe('browser_semantic_plan',{}, {'needsDecision':True,'denied':True,
+            'candidates':[{'role':'button','name':'Save'}], 'inventoryCount':4})
+        self.assertEqual(reply['candidates'][0]['name'],'Save')
+        self.assertNotIn('latestInspection',dump(ctx.request(ExecutionState(),{})))
+
     def test_only_latest_snapshot_and_exchange_survive(self):
         ctx=StepContext(Step(1,'Act'),config(),Secrets([])); state=ExecutionState()
         for label in ['OLD_SNAPSHOT','NEW_SNAPSHOT']:
@@ -102,6 +109,26 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
              {'executed':True,'evidenceId':'a','assertion':{'kind':'value'},'activePage':'page1'}])
         self.assertEqual(result['status'],'COMPLETED'); self.assertEqual(state.completed_steps,[5])
         self.assertTrue(any('Recoverable' in line for line in logs))
+
+    async def test_semantic_plan_preserves_multiple_assertion_evidence_ids(self):
+        class AI:
+            def __init__(self): self.turn = 0
+            async def request(self, _):
+                self.turn += 1
+                if self.turn == 1:
+                    return model(fc('browser_semantic_plan',{'actions':[{'type':'click','target':{'name':'Tab'}},
+                        {'type':'assert','kind':'visible','target':{'name':'Panel'}}]}))
+                return model(fc('finish_step',{'status':'COMPLETED','reason':'Verified',
+                    'verification':'Both expected UI conditions passed','evidenceIds':['a','b']}))
+        class Browser:
+            tools=[{'name':'browser_semantic_plan'}]
+            async def call(self, name, args):
+                return {'executed':True,'mutating':True,'evidenceIds':['a','b'],
+                    'assertions':[{'kind':'visible'},{'kind':'selected'}],'activePage':'page'}
+        result=await run_step(Step(3,'Open tab','','Panel visible'),AI(),Browser(),ExecutionState(),
+                              config(),Secrets([]),lambda _:None)
+        self.assertEqual(result['status'],'COMPLETED')
+        self.assertEqual([entry['id'] for entry in result['evidence']],['a','b'])
 
     async def test_model_multicall_stops_after_transition(self):
         result,calls,_,_=await self.execute([

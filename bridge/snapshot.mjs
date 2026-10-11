@@ -3,6 +3,28 @@
 const MODAL_SCOPES = ['[role="dialog"]:visible', 'nz-modal-container:visible',
   '.ant-modal:visible', '[aria-modal="true"]:visible', '.modal:visible', 'dialog[open]:visible'];
 
+// Keep the full MCP tree for diagnostics, but never expose live form values or
+// secret-bearing fields in a DEBUG log. This does not alter the returned snapshot.
+export function debugSnapshot(snapshot, inputValues, guard) {
+  const values = [...new Set(inputValues.filter(value => typeof value === 'string' && value))]
+    .sort((a, b) => b.length - a.length);
+  const sensitiveKey = /^(?:value|inputValue|password|authorization|cookie|.*(?:token|secret|session|api[_-]?key|credential).*)$/i;
+  function scrub(node, key = '') {
+    if (sensitiveKey.test(key)) return '<masked>';
+    if (typeof node === 'string') {
+      let text = node;
+      for (const value of values) text = text.split(value).join('<masked>');
+      return guard.clean(text);
+    }
+    if (Array.isArray(node)) return node.map(item => scrub(item));
+    if (node && typeof node === 'object')
+      return Object.fromEntries(Object.entries(node).map(([field, value]) => [field, scrub(value, field)]));
+    return node;
+  }
+  const sanitized = scrub(snapshot);
+  return typeof sanitized === 'string' ? sanitized : JSON.stringify(sanitized, null, 2);
+}
+
 export async function modalScope(page, notices) {
   for (const selector of MODAL_SCOPES) {
     const candidates = page.locator(selector);

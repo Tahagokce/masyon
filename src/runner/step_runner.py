@@ -85,7 +85,7 @@ async def run_step(step, ai, browser, state, config, secrets, log):
                     state.metrics["browserToolCalls"] += result.get("batchExecuted", 1)
                     state.observe(result)
                     for notice in result.get("notices") or []: log(notice)
-                    if result.get("unchanged") or result.get("denied"):
+                    if (result.get("unchanged") or result.get("denied")) and not result.get("executed"):
                         no_progress += 1
                         log(f"[ORCHESTRATION] {result.get('reason', 'Browser state unchanged')}")
                         if no_progress >= 2:
@@ -111,11 +111,14 @@ async def run_step(step, ai, browser, state, config, secrets, log):
                                     "errorDetails":detail}
                         log("[SNAPSHOT] Recoverable inspection error; continuing with a new inspection or known target")
                     actions += int(bool(result.get("executed")))
-                    if result.get("evidenceId"):
-                        item = {"id": result["evidenceId"], "sequence": sequence,
-                                "assertion": result.get("assertion"), "page": result.get("activePage")}
-                        evidence[item["id"]] = item
-                        log(f"[VERIFY] Browser assertion passed ({item['id']})")
+                    ids = result.get("evidenceIds") or ([result["evidenceId"]] if result.get("evidenceId") else [])
+                    assertions = result.get("assertions") or ([result.get("assertion")] if ids else [])
+                    for index, evidence_id in enumerate(ids):
+                        item = {"id": evidence_id, "sequence": sequence,
+                                "assertion": assertions[index] if index < len(assertions) else None,
+                                "page": result.get("activePage")}
+                        evidence[evidence_id] = item
+                        log(f"[VERIFY] Browser assertion passed ({evidence_id})")
                     if not result.get("isError") and not (result.get("unchanged") or result.get("denied")):
                         log(f"[MCP] {name} successful")
                     checkpoint_required = bool(result.get("transition") or result.get("checkpointRequired"))

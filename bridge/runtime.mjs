@@ -7,10 +7,13 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { Journal } from './recording.mjs';
 import { SecretGuard } from './security.mjs';
-import { inspectSnapshot, compactSnapshot } from './snapshot.mjs';
+import { inspectSnapshot, compactSnapshot, debugSnapshot } from './snapshot.mjs';
 import { executeBatch, screenStamp, BATCH_TOOLS } from './batch.mjs';
 import { staleRef, descriptor, hasUsableDescriptor, rememberSnapshotRefs, resolveAssertionTarget } from './assertion-recovery.mjs';
 import { actionLogLines } from './action-logging.mjs';
+import { assertionRequest, assertionResolved, assertionFailure } from './assertion-logging.mjs';
+import { uiInventory } from './ui-inventory.mjs';
+import { executeSemanticAction, executeSemanticPlan } from './semantic-executor.mjs';
 
 const require = createRequire(import.meta.url);
 const ALLOWED = new Set(['browser_navigate', 'browser_navigate_back', 'browser_navigate_forward',
@@ -21,7 +24,18 @@ const READ = new Set(['browser_snapshot', 'browser_wait_for']);
 const str = { type: 'string' };
 const schema = (name, description, properties = {}, required = []) => ({name, description,
   inputSchema: {type: 'object', properties, required, additionalProperties: false}});
+const semanticTarget = {type:'object',properties:{name:str,roleHint:str,label:str,text:str,placeholder:str},
+  additionalProperties:false};
+const semanticAction = {type:'object',properties:{
+  type:{type:'string',enum:['click','fill','select','check','uncheck','press','assert']},
+  target:semanticTarget,value:str,key:str,
+  kind:{type:'string',enum:['visible','hidden','text','value','enabled','disabled','checked','unchecked','selected','unselected','url']},
+  expected:str},required:['type'],additionalProperties:false};
 export const CONTROL_TOOLS = [
+  schema('browser_semantic_plan', 'Execute a semantic action plan on the active page. Resolve elements from a whole-page UI inventory; stop for ambiguity or failure. Include expected-result assertions as type=assert.',
+    {actions:{type:'array',minItems:1,maxItems:10,items:semanticAction}},['actions']),
+  schema('browser_semantic_action', 'Execute one semantic browser action using the current UI inventory.',
+    {action:semanticAction},['action']),
   schema('browser_batch', 'Execute up to five known actions on the same stable screen. Stops after click/key/submit or any UI transition. Inspect and replan remaining actions at the next checkpoint.',
     {actions:{type:'array', minItems:1, maxItems:5, items:{type:'object', properties:{
       tool:{type:'string', enum:BATCH_TOOLS}, arguments:{type:'object', properties:{
@@ -40,7 +54,7 @@ export const CONTROL_TOOLS = [
   schema('browser_close_page', 'Close the current browser tab.'),
   schema('browser_assert', 'Verify UI after the action. Uses actual browser state, retries for 5s and records the assertion. target is an observed snapshot reference or selector. For URL checks, omit target.',
     {kind: {type: 'string', enum: ['visible','hidden','text','value','enabled','disabled','checked','unchecked','url']},
-     target: str, expected: str, targetDescriptor: {type:'object', properties:{
+     target: str, expected: str, semanticTarget, targetDescriptor: {type:'object', properties:{
        id:str, role:str, name:str, label:str, text:str, selector:str}, additionalProperties:false}}, ['kind']),
 ];
 
@@ -86,13 +100,64 @@ export class Runtime {
   get logging() { return this.logLevel === 'DEBUG' || this.logLocators; }
   emit(line) { if (this.logging) this.logEvents.push(this.guard.clean(line)); }
   drainLogEvents() { return this.logEvents.splice(0); }
-  stateLine() {
+  safeActiveUrl() {
     const alias = this.pages.get(this.active)?.alias || 'unknown';
-    const url = (this.pageState().find(page => page.alias === alias)?.url || 'about:blank')
+    return (this.pageState().find(page => page.alias === alias)?.url || 'about:blank')
       .replace(/(\/(?:access[_-]?token|refresh[_-]?token|api[_-]?key|token|session|auth|secret|key)\/)[^/?#]+/gi, '$1[REDACTED]');
-    return `[STATE] v${this.stateVersion} page=${alias} url=${url}`;
   }
+  stateLine() { return `[STATE] v${this.stateVersion} page=${this.pages.get(this.active)?.alias || 'unknown'} url=${this.safeActiveUrl()}`; }
   capturedSnapshot() { if (this.logLevel === 'DEBUG') this.emit(`[SNAPSHOT] captured state=v${this.stateVersion}`); }
+  async currentFormValues() {
+    return this.active.evaluate(() =>
+      [...document.querySelectorAll('input,textarea,select,[contenteditable]')]
+        .map(element => 'value' in element ? element.value : element.textContent).filter(Boolean));
+  }
+  async logRawSnapshot(snapshot) {
+    if (this.logLevel !== 'DEBUG' || snapshot === undefined) return;
+    let raw;
+    try {
+      const inputValues = await this.currentFormValues();
+      raw = debugSnapshot(snapshot, inputValues, this.guard);
+    } catch {
+      raw = '<unavailable: form values could not be checked safely>';
+    }
+    this.emit(`[SNAPSHOT] page=${this.pages.get(this.active)?.alias || 'unknown'} state=v${this.stateVersion} url=${this.safeActiveUrl()}`);
+    this.emit('[SNAPSHOT_RAW_BEGIN]');
+    this.emit(raw);
+    this.emit('[SNAPSHOT_RAW_END]');
+  }
+  async assertionActual(kind, locator) {
+    if (kind === 'url') return {url:this.safeActiveUrl()};
+    if (!locator) return null;
+    try {
+      const code = `async (page) => {
+        const target = ${locator};
+        const count = await target.count();
+        if (count !== 1) return {count, visible: count === 0 ? false : null};
+        const actual = {count};
+        try { actual.visible = await target.isVisible(); } catch {}
+        try { actual.selected = await target.getAttribute('aria-selected'); } catch {}
+        try { if (actual.selected === null) actual.selected = await target.getAttribute('selected'); } catch {}
+        try { actual.text = await target.innerText(); } catch {}
+        return actual;
+      }`;
+      const response = await this.raw(this.runCodeName, {code});
+      return response.isError ? null : JSON.parse(response.result || 'null');
+    } catch { return null; }
+  }
+  async logAssertionFailure(args, locator, reason, initialValues) {
+    try {
+      const actual = await this.assertionActual(args.kind, locator);
+      let inputValues = initialValues;
+      try { inputValues = [...initialValues, ...await this.currentFormValues()]; }
+      catch { if (actual) delete actual.text; }
+      this.logEvents.push(this.guard.clean(assertionFailure(args, locator, actual, reason,
+        inputValues, this.guard)));
+    } catch {
+      // Diagnostics must never replace the assertion's original outcome.
+      this.logEvents.push('[ASSERT_FAILURE]\n- assertion kind: <unavailable>\n- actual state: <unavailable>');
+    }
+  }
   async initialize() {
     const launch = {headless: process.env.HEADLESS !== 'false'};
     if (process.env.PLAYWRIGHT_EXECUTABLE_PATH) launch.executablePath = process.env.PLAYWRIGHT_EXECUTABLE_PATH;
@@ -120,6 +185,10 @@ export class Runtime {
       if (copy.name === 'browser_snapshot') {
         copy.description = 'Inspect a relevant visible target; defaults to last visible modal, otherwise page. Use scope=page explicitly to inspect outside a modal. Ambiguous scope falls back safely.';
         copy.inputSchema.properties.scope = {type:'string',enum:['auto','page']};
+      }
+      if (['browser_click','browser_type','browser_select_option'].includes(copy.name)) {
+        copy.inputSchema.properties.semanticTarget = semanticTarget;
+        copy.inputSchema.required = (copy.inputSchema.required || []).filter(item => item !== 'target');
       }
       return copy;
     }), ...CONTROL_TOOLS];
@@ -174,6 +243,7 @@ export class Runtime {
     const result = await this.client.callTool({name, arguments: {...args, _meta: {json}}});
     if (json) {
       const payload = JSON.parse(result.content.filter(c => c.type === 'text').map(c => c.text).join('\n'));
+      await this.logRawSnapshot(payload.snapshot);
       return {...payload, isError:Boolean(result.isError || payload.isError)};
     }
     const parsed = this.fork.tools.parseResponse(result);
@@ -239,7 +309,7 @@ export class Runtime {
       idFirstVerified:false, ...this.fork.provenance, observedCode:[clickCode,fillCode]};
     return {idFirstVerified:true, ...this.fork.provenance, observedCode:[clickCode,fillCode]};
   }
-  async assertion(args) {
+  async assertion(args, onResolved = () => {}) {
     const kinds = new Set(['visible','hidden','text','value','enabled','disabled','checked','unchecked','url']);
     if (!kinds.has(args.kind)) throw new Error('Unsupported assertion kind');
     const pageAlias = this.pages.get(this.active)?.alias;
@@ -257,6 +327,7 @@ export class Runtime {
         if (!expression || !/^(page\.)?(locator|getBy|frameLocator)/.test(expression)) throw new Error('Fork locator generation contract differs');
         if (!expression.startsWith('page.')) expression = 'page.' + expression;
       }
+      onResolved(expression || undefined);
       if (['text','value','url'].includes(args.kind) && typeof args.expected !== 'string') throw new Error('Assertion needs expected string');
       const expected = JSON.stringify(args.expected ?? '');
       const checks = {visible:'await target.isVisible()', hidden:'!(await target.isVisible())',
@@ -336,6 +407,19 @@ export class Runtime {
     return result;
   }
   async call(name, args = {}) {
+    if (name === 'browser_semantic_plan') {
+      if (!this.journal.active) throw new Error('Start verified recording before browser actions');
+      if (this.guard.hasSecret(JSON.stringify(args))) throw new Error('Use environment variable names, not raw secrets');
+      return executeSemanticPlan(this,args);
+    }
+    if (args.semanticTarget && ['browser_click','browser_type','browser_select_option','browser_assert'].includes(name)) {
+      const type = {browser_click:'click',browser_type:'fill',browser_select_option:'select',browser_assert:'assert'}[name];
+      const action = {type,target:args.semanticTarget};
+      if (type === 'assert') { action.kind = args.kind; action.expected = args.expected; }
+      if (type === 'fill') action.value = args.text;
+      if (type === 'select') action.value = args.values?.[0];
+      return this.call('browser_semantic_action',{action});
+    }
     if (name === 'browser_batch' || (name === 'browser_fill_form' && args.fields?.length > 1)) {
       if (!this.journal.active) throw new Error('Start verified recording before browser actions');
       return executeBatch(this, name === 'browser_batch' ? args : {actions:[{tool:name,arguments:args}]});
@@ -393,13 +477,18 @@ export class Runtime {
       return {isError:false, denied:true, reason:`PAGE_LOCKED: ${alias} remains active for Jira step ${this.step.number}; no new page or navigation requires a switch. Assert on this page or finish BLOCKED.`,
         activePage:alias, pages:this.pageState(), metrics:this.metrics(), logEvents:this.drainLogEvents()};
     }
-    const mutating = !READ.has(name) && name !== 'browser_assert';
+    const mutating = name === 'browser_semantic_action' ? args.action?.type !== 'assert'
+      : !READ.has(name) && name !== 'browser_assert';
     const beforeScreen = mutating ? await screenStamp(this) : undefined;
+    const previousMutation = this.lastMutation;
     const entry = this.journal.begin(alias || 'page', name, mutating);
     this.inflight = entry;
     if (mutating) this.lastMutation = entry;
     let result;
     let actionLogged = false;
+    let assertionInputs = [];
+    let assertionLocator;
+    let assertionFailureLogged = false;
     try {
       if (name === 'browser_snapshot') {
         result = await inspectSnapshot(this, args);
@@ -428,7 +517,19 @@ export class Runtime {
         result = await this.raw('browser_tabs', {action:'close'});
         result['ran playwright code'] = 'await page.close();';
       } else if (name === 'browser_assert') {
-        result = await this.assertion(args);
+        try { assertionInputs = await this.currentFormValues(); } catch {}
+        this.logEvents.push(this.guard.clean(assertionRequest(args, alias, assertionInputs, this.guard)));
+        result = await this.assertion(args, locator => {
+          assertionLocator = locator;
+          this.logEvents.push(this.guard.clean(assertionResolved(locator, assertionInputs, this.guard)));
+        });
+        if (result.isError) {
+          await this.logAssertionFailure(args, result.resolvedLocator || assertionLocator,
+            result.error, assertionInputs);
+          assertionFailureLogged = true;
+        }
+      } else if (name === 'browser_semantic_action') {
+        result = await executeSemanticAction(this,args.action,entry);
       } else {
         result = await this.raw(name, args);
       }
@@ -444,20 +545,28 @@ export class Runtime {
       // Failed calls may have performed partial work; retain available upstream code
       // and mark the final spec failed instead of claiming a complete recording.
       entry.code = this.guard.assertCode(code);
-      if (!result.isError && mutating && !code && !['browser_switch_page','browser_handle_dialog'].includes(name))
+      if (result.denied && mutating) this.lastMutation = previousMutation;
+      if (!result.isError && !result.denied && mutating && !code && !['browser_switch_page','browser_handle_dialog'].includes(name))
         throw new Error('Action succeeded without generated code; recording is incomplete');
       await this.synchronize();
-      if (this.logging && name !== 'browser_snapshot') {
+      if (name === 'browser_semantic_action' && !result.isError && !result.denied && mutating) {
+        try {
+          const inventory = await uiInventory(this.active);
+          result.inventoryCount = inventory.length;
+          this.emit(`[INVENTORY] candidateCount=${inventory.length}`);
+        } catch { this.emit('[INVENTORY] unavailable after action'); }
+      }
+      if (this.logging && name !== 'browser_snapshot' && name !== 'browser_semantic_action') {
         const actionLines = actionLogLines(name, alias, code, result.resolvedLocator, args,
           this.guard, this.logLocators);
         this.logEvents.unshift(...actionLines);
         actionLogged = true;
       }
-      if (mutating && !result.isError) {
+      if (mutating && !result.isError && !result.denied) {
         this.stateVersion++;
         if (this.logLevel === 'DEBUG') this.emit(this.stateLine());
       }
-      if (this.step && !result.isError) {
+      if (this.step && !result.isError && !result.denied) {
         if (mutating) this.step.revision++;
         if (name === 'browser_snapshot') {
           this.step.snapshotRevision = this.step.revision;
@@ -471,15 +580,18 @@ export class Runtime {
       }
       if (result.snapshot) rememberSnapshotRefs(this.refDescriptors,
         this.pages.get(this.active)?.alias, result.snapshot);
-      const compact = {isError:result.isError, executed:!result.isError && (mutating || name === 'browser_assert'), mutating,
+      const compact = {isError:result.isError, executed:!result.isError && !result.denied &&
+        (mutating || name === 'browser_assert' || name === 'browser_semantic_action'), mutating:mutating && !result.denied,
         result:result.result, error:result.error, snapshot:result.snapshot,
         modalState:result['modal state'], evidenceId:result.evidenceId, assertion:result.assertion,
+        denied:result.denied, needsDecision:result.needsDecision, reason:result.reason,
+        candidates:result.candidates, inventoryCount:result.inventoryCount,
         activePage:this.pages.get(this.active)?.alias, pages:this.pageState(),
         recoverable:result.recoverable, recoveryIncomplete:result.recoveryIncomplete,
         notices:result.notices, snapshotScope:result.snapshotScope,
         snapshotFallback:result.snapshotFallback,
         errorClass:result.isError?(result.errorClass || 'PlaywrightError'):undefined,
-        transition:mutating && (beforeScreen !== await screenStamp(this) || !beforeScreen ||
+        transition:mutating && !result.denied && (beforeScreen !== await screenStamp(this) || !beforeScreen ||
           ['browser_click','browser_press_key','browser_handle_dialog'].includes(name)), metrics:this.metrics(),
         logEvents:this.drainLogEvents()};
       Object.assign(compact, compactSnapshot(compact.snapshot));
@@ -487,7 +599,10 @@ export class Runtime {
       if (compact.isError) Object.assign(compact, this.guard.diagnostic({name:compact.errorClass,message:compact.error}, name, compact.activePage));
       return this.guard.object(compact);
     } catch (error) {
-      if (this.logging && !actionLogged && name !== 'browser_snapshot')
+      if (name === 'browser_assert' && !assertionFailureLogged)
+        await this.logAssertionFailure(args, result?.resolvedLocator || assertionLocator,
+          error.message, assertionInputs);
+      if (this.logging && !actionLogged && name !== 'browser_snapshot' && name !== 'browser_semantic_action')
         this.logEvents.unshift(...actionLogLines(name, alias, result?.['ran playwright code'],
           result?.resolvedLocator, args, this.guard, this.logLocators));
       if (mutating) this.journal.problem ||= 'An action could not be recorded completely';

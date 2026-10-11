@@ -88,6 +88,25 @@ live('valid ref assertion does not capture another snapshot', async () => {
   assert.equal(result.isError,false,JSON.stringify(result));
   assert.equal(runtime.snapshotCount,before);
   assert.equal(result.notices,undefined);
+  assert.ok(result.logEvents.some(line => line.startsWith('[ASSERT_REQUEST]\n')));
+  assert.ok(result.logEvents.some(line => line.includes('[ASSERT_RESOLVED]\n- actual locator used: page.')));
+  assert.equal(result.logEvents.some(line => line.startsWith('[ASSERT_FAILURE]')),false);
+});
+
+live('failed assertion logs actual visibility, text, and selected state', async () => {
+  await runtime.active.setContent('<button id="commodity-tab" role="tab" aria-selected="false" hidden>Commodity Subtypes</button>');
+  const result = await runtime.call('browser_assert',{kind:'visible',target:'#commodity-tab',
+    targetDescriptor:{role:'tab',name:'Commodity Subtypes'}});
+  assert.equal(result.isError,true);
+  const request = result.logEvents.find(line => line.startsWith('[ASSERT_REQUEST]'));
+  const resolved = result.logEvents.find(line => line.startsWith('[ASSERT_RESOLVED]'));
+  const failure = result.logEvents.find(line => line.startsWith('[ASSERT_FAILURE]'));
+  assert.match(request,/- kind: visible/);
+  assert.match(request,/- page alias: page/);
+  assert.match(resolved,/- actual locator used: page\.locator\(['"]#commodity-tab['"]\)/);
+  assert.match(failure,/- actual visible: false/);
+  assert.match(failure,/- actual text: Commodity Subtypes/);
+  assert.match(failure,/- actual selected: false/);
 });
 
 live('targetDescriptor alone resolves the SL Codes tab', async () => {
@@ -124,6 +143,9 @@ live('valid ref with descriptor keeps the ref and does not inspect again', async
 live('missing target and descriptor has a clear validation error', async () => {
   await assert.rejects(() => runtime.call('browser_assert',{kind:'visible'}),
     /Assertion requires target or targetDescriptor/);
+  const logs = runtime.drainLogEvents().join('\n');
+  assert.match(logs,/\[ASSERT_REQUEST\]/);
+  assert.match(logs,/\[ASSERT_FAILURE\]/);
 });
 
 live('unresolvable descriptor fails cleanly without assertion evidence', async () => {
@@ -134,4 +156,5 @@ live('unresolvable descriptor fails cleanly without assertion evidence', async (
   assert.equal(result.errorClass,'AssertionTargetError');
   assert.match(result.error,/could not be resolved uniquely/);
   assert.equal(result.evidenceId,undefined);
+  assert.ok(result.logEvents.some(line => line.startsWith('[ASSERT_FAILURE]')));
 });

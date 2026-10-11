@@ -57,6 +57,9 @@ live('DEBUG logs state and the snapshot version', async () => {
   assert.ok(started.logEvents.some(line => /^\[STATE\] v0 page=page(?: url=)/.test(line)));
   const {found,snapshot} = await ref('button','Save');
   assert.ok(snapshot.logEvents.includes('[SNAPSHOT] captured state=v0'));
+  assert.ok(snapshot.logEvents.includes('[SNAPSHOT_RAW_BEGIN]'));
+  assert.ok(snapshot.logEvents.includes('[SNAPSHOT_RAW_END]'));
+  assert.ok(snapshot.logEvents.some(line => line.includes('"name": "Save"')));
   const {result} = await actionWithForkCode('browser_click',{target:found});
   assert.ok(result.logEvents.some(line => /^\[STATE\] v1 page=page(?: url=)/.test(line)));
   const postClick = await runtime.call('browser_snapshot');
@@ -96,6 +99,10 @@ live('fill logs its locator and a masked marker, never its value', async () => {
   assert.ok(result.logEvents.includes(`[LOCATOR] ${actual}`));
   assert.ok(result.logEvents.includes('[VALUE] <masked>'));
   assert.equal(result.logEvents.join('\n').includes(value),false);
+  const snapshot = await runtime.call('browser_snapshot');
+  assert.equal(snapshot.isError,false);
+  assert.equal(snapshot.logEvents.join('\n').includes(value),false);
+  assert.ok(snapshot.logEvents.includes('[SNAPSHOT_RAW_BEGIN]'));
 });
 
 live('batched fills retain each real locator log and mask all values', async () => {

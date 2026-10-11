@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {actionLocators, actionLogLines} from '../bridge/action-logging.mjs';
 import {SecretGuard} from '../bridge/security.mjs';
 import {Runtime} from '../bridge/runtime.mjs';
+import {assertionRequest, assertionResolved, assertionFailure} from '../bridge/assertion-logging.mjs';
 
 const guard = new SecretGuard([]);
 
@@ -56,4 +57,35 @@ test('state URL omits query strings and masks token path segments', () => {
   assert.match(line,/\[STATE\] v0 page=page url=https:\/\/example\.test\/access-token\/\[REDACTED\]/);
   assert.equal(line.includes('opaque-token'),false);
   assert.equal(line.includes('hidden'),false);
+});
+
+test('assertion diagnostics include request, resolved locator, and actual UI state', () => {
+  const args = {kind:'visible',target:'e137',
+    targetDescriptor:{role:'tab',name:'Commodity Subtypes'}};
+  const request = assertionRequest(args,'page1',[],guard);
+  assert.match(request,/\[ASSERT_REQUEST\]/);
+  assert.match(request,/- target: e137/);
+  assert.match(request,/- targetDescriptor: \{"role":"tab","name":"Commodity Subtypes"\}/);
+  assert.match(request,/- page alias: page1/);
+  const locator = "page.getByRole('tab', { name: 'Commodity Subtypes' })";
+  assert.match(assertionResolved(locator,[],guard),/actual locator used: page\.getByRole/);
+  const failure = assertionFailure(args,locator,
+    {count:1,visible:false,text:'Commodity Subtypes',selected:'false'},'Expected result assertion failed',[],guard);
+  assert.match(failure,/actual visible: false/);
+  assert.match(failure,/actual text: Commodity Subtypes/);
+  assert.match(failure,/actual selected: false/);
+});
+
+test('assertion diagnostics mask form values and secret-bearing selectors', () => {
+  const args = {kind:'value',target:'input[value="private-value"]',expected:'private-value',
+    targetDescriptor:{selector:'input[value="private-value"]'}};
+  const request = assertionRequest(args,'page1',['private-value'],guard);
+  const resolved = assertionResolved("page.locator('input[value=\"private-value\"]')",
+    ['private-value'],guard);
+  const failure = assertionFailure(args,"page.locator('#password')",
+    {visible:true,text:'private-value',selected:null},undefined,['private-value'],guard);
+  for (const logged of [request,resolved,failure]) assert.equal(logged.includes('private-value'),false);
+  assert.match(request,/expected: <masked>/);
+  assert.match(resolved,/actual locator used: <redacted>/);
+  assert.match(failure,/actual text: <masked>/);
 });

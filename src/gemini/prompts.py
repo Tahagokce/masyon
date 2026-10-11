@@ -8,19 +8,24 @@ value later. Omit value for a unique automation ID; supply value for a required
 format such as a date or number. Never generate or register credentials.
 Use named credentials as fill/type values, e.g. WBS_USERNAME and WBS_PASSWORD.
 Never ask for, emit, or discover raw secrets. Do not inspect cookies or storage.
-Use browser_snapshot only when necessary, preferably scoped to a relevant target.
-The default snapshot selects the last visible dialog, then falls back to the page.
-For deterministic fills/selections on the SAME stable screen, use browser_batch
-with up to five actions (e.g. fill username, fill password, click login). A click,
-key, submit, navigation, modal, popup or dynamic change ends the batch. Remaining
-actions are NOT executed: inspect and replan at that checkpoint. Do not batch
-through transitions or uncertain selectors. Use browser_fill_form for stable forms.
+Plan normal UI work with browser_semantic_plan. Supply actions with type and a
+semantic target (name, roleHint, label, text, placeholder); supply value for fill
+or select, key for press, and kind/expected for assertions. Derive target names
+from the Jira instruction and rendered UI wording. Never invent DOM IDs, CSS
+selectors, or snapshot refs. The browser inventories the whole active page and
+chooses locators deterministically. Include expected-result assertions in the
+plan when the target is clear. If resolution is ambiguous or unresolved, refine
+the semantic target or inspect once to make a higher-level decision.
+Use browser_snapshot only for debugging, unexpected UI state, ambiguity, or
+legacy assertion recovery. It is not the normal locator discovery path.
+Legacy snapshot-ref browser actions remain available when needed.
 Older snapshots are removed; only latestInspection and compact state remain.
-Recoverable snapshot errors do not imply the business action failed; retry a
-specific visible target or whole-page scope. Never use snapshots as assertion evidence.
-Do not guess target references. New pages are selected automatically; their stable
-aliases are returned. Use browser_switch_page to return to a known alias.
-Verify every clause of Expected Result via browser_assert AFTER all actions.
+Recoverable snapshot errors do not imply the business action failed. Never use
+snapshots as assertion evidence. New pages are selected automatically and
+inventoried. Use browser_switch_page only when the test explicitly needs to
+return to an earlier page.
+Verify every clause of Expected Result via semantic type=assert after actions.
+The legacy browser_assert remains available for snapshot-ref compatibility.
 An assertion that merely checks an unrelated element is not verification.
 finish_step(COMPLETED) must cite every relevant successful assertion evidenceId
 from this step and explain how those assertions establish the expected result.

@@ -28,7 +28,8 @@ class StepContext:
                 "batchExecuted":result.get("batchExecuted"), "status":"ok"}))
             self.operations = self.operations[-8:]
         # Snapshot lives once in the current context, never in historical replies.
-        keep = ("isError","executed","unchanged","denied","error","errorClass","recoverable","evidenceId","assertion",
+        keep = ("isError","executed","unchanged","denied","needsDecision","candidates","inventoryCount",
+                "error","errorClass","recoverable","evidenceId","evidenceIds","assertion","assertions",
                 "transition","checkpointRequired","batchExecuted","remainingActions","results","value","reason","modalState")
         return self.secrets.object({k:result[k] for k in keep if result.get(k) is not None})
 
