@@ -133,9 +133,12 @@ See the pre-implementation inspection and [implementation plan](docs/IMPLEMENTAT
 * `src/state`, `src/security`, `src/recording`: reusable values, redaction and export.
 * `bridge`: fork-only loading, real upstream MCP server, page events and codegen capture.
 
-Normal Jira actions now use `browser_semantic_plan`. Gemini supplies only action
-type, a semantic target such as `{ "name": "Save", "roleHint": "button" }`, and
-an optional value or assertion. `bridge/ui-inventory.mjs` scans the whole active
+Every Jira step first calls the dedicated Gemini `submit_semantic_plan` function.
+The runner validates its `actions` and `expectedAssertions`, then invokes
+`browser_semantic_plan` directly. Ordinary steps cannot choose a snapshot as
+their first browser operation. Gemini supplies only action type, a semantic target
+such as `{ "name": "Save", "roleHint": "button" }`, and an optional value or
+assertion. `bridge/ui-inventory.mjs` scans the whole active
 page, including sibling tabs, and collects rendered names, roles, labels and
 locator attributes. `bridge/locator-resolver.mjs` picks a unique semantic match,
 then tries a stable DOM ID, test ID, role and accessible name, label, exact text,
@@ -144,8 +147,9 @@ skipped. `bridge/semantic-executor.mjs` performs the action on the fork's real
 Playwright page and records the exact locator it executed. The bridge automatically
 selects new pages and inventories them after mutations.
 
-Ambiguous or unresolved targets return a compact candidate list for a model
-decision; the executor never guesses one. Semantic assertions produce the same
+Ambiguous or unresolved targets return `AMBIGUOUS` or `NO_MATCH` with a compact
+candidate list; only then does the runner open the fallback model conversation.
+The executor never guesses one. Semantic assertions produce the same
 evidence IDs used by the completion gate. `browser_snapshot`, snapshot refs,
 `browser_batch` and legacy `browser_assert` remain available for compatibility,
 unexpected UI state and recovery. The legacy click/type/select/assert tools also
@@ -199,8 +203,8 @@ outside a modal. Default depth is 5; scoped/deeper requests remain available.
 Snapshot trees are trimmed to about 4,000 characters as valid JSON with a visible
 truncation flag; text, references and relevant element state are preserved.
 
-Use `browser_semantic_plan` for normal UI work; its semantic actions are resolved
-against a fresh active-page inventory without asking Gemini for selectors.
+The runner invokes `browser_semantic_plan` for normal UI work; its semantic actions
+are resolved against a fresh active-page inventory without asking Gemini for selectors.
 `browser_batch` remains available for 1–5 legacy ref actions on one stable screen.
 Native multi-field `browser_fill_form` uses the same per-field guard.
 Every action still runs and records through MCP. Navigation/reload, new pages,

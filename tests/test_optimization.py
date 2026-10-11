@@ -12,7 +12,7 @@ from src.gemini.client import GeminiClient
 from src.gemini.context import StepContext
 from src.jira.models import Step
 from src.recording.service import write_json
-from src.runner.step_runner import run_step
+from src.runner.step_runner import run_step, run_fallback_step
 from src.security.secrets import Secrets
 from src.state.execution_state import ExecutionState
 
@@ -98,7 +98,7 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
             calls=[]
             async def call(self,name,args): self.calls.append(name); return browser_results.pop(0)
         browser=Browser(); logs=[]; state=ExecutionState()
-        result=await run_step(Step(5,'Fill dialog','','Fields filled'),AI(),browser,state,config(),Secrets([]),logs.append)
+        result=await run_fallback_step(Step(5,'Fill dialog','','Fields filled'),AI(),browser,state,config(),Secrets([]),logs.append)
         return result,browser.calls,logs,state
 
     async def test_recoverable_inspection_does_not_fail_step(self):
@@ -113,6 +113,10 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_semantic_plan_preserves_multiple_assertion_evidence_ids(self):
         class AI:
             def __init__(self): self.turn = 0
+            async def plan_step(self, step, state, base_url, credential_names):
+                return {'actions':[{'type':'click','target':{'name':'Tab'}}],
+                        'expectedAssertions':[{'type':'visible','target':{'name':'Panel'}},
+                                              {'type':'selected','target':{'name':'Tab'}}]}
             async def request(self, _):
                 self.turn += 1
                 if self.turn == 1:

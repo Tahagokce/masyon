@@ -67,8 +67,14 @@ live('dynamic ID falls back to role and ambiguous targets do not click',async ()
   const ambiguous = await runtime.call('browser_semantic_action',{
     action:{type:'click',target:{name:'Save',roleHint:'button'}}});
   assert.equal(ambiguous.needsDecision,true);
+  assert.equal(ambiguous.resolverStatus,'AMBIGUOUS');
   assert.equal(ambiguous.executed,false);
   assert.equal(await runtime.active.evaluate(() => window.ambiguous || 0),0);
+  const before = runtime.snapshotCount;
+  const missing = await runtime.call('browser_semantic_action',{
+    action:{type:'click',target:{name:'Unknown',roleHint:'button'}}});
+  assert.equal(missing.resolverStatus,'NO_MATCH');
+  assert.equal(runtime.snapshotCount,before);
 });
 
 live('label, select, checkbox and press actions use semantic targets',async () => {
@@ -91,6 +97,10 @@ live('label, select, checkbox and press actions use semantic targets',async () =
   assert.equal(await runtime.active.locator('select').inputValue(),'High');
   assert.equal(await runtime.active.locator('input[type=checkbox]').isChecked(),true);
   assert.equal(await runtime.active.locator('#pressed').innerText(),'Submitted');
+  const unchecked = await runtime.call('browser_semantic_action',{
+    action:{type:'uncheck',target:{name:'Enabled',roleHint:'checkbox'}}});
+  assert.equal(unchecked.isError,false,JSON.stringify(unchecked));
+  assert.equal(await runtime.active.locator('input[type=checkbox]').isChecked(),false);
 });
 
 live('legacy tool names accept a semantic target without a snapshot ref',async () => {
@@ -129,6 +139,41 @@ live('new page is selected automatically and inventoried after a semantic click'
   assert.ok(result.logEvents.some(line => line.includes('new page detected: page1')));
   assert.ok((await uiInventory(runtime.active)).some(item => item.name === 'Save'));
   await runtime.call('browser_close_page');
+});
+
+live('semantic click detects a dialog and asserts it without a snapshot',async () => {
+  await runtime.active.setContent(`<button id="create" onclick="document.querySelector('#form').hidden=false">Create</button>
+    <div id="form" role="dialog" aria-label="New Definition" hidden><button>Save</button></div>`);
+  const before = runtime.snapshotCount;
+  const result = await runtime.call('browser_semantic_plan',{actions:[
+    {type:'click',target:{name:'Create',roleHint:'button'}},
+    {type:'assert',kind:'visible',target:{name:'New Definition',roleHint:'dialog'}}]});
+  assert.equal(result.isError,false,JSON.stringify(result));
+  assert.equal(result.evidenceIds.length,1);
+  assert.equal(runtime.snapshotCount,before);
+  assert.ok(result.logEvents.includes('[UI] dialog detected'));
+});
+
+live('delayed dialog resolves through inventory polling without a snapshot',async () => {
+  await runtime.active.setContent(`<button id="open-later" onclick="setTimeout(() => document.querySelector('#later').hidden=false, 150)">Open later</button>
+    <div role="dialog" aria-label="Delayed form" id="later" hidden>Ready</div>`);
+  const before = runtime.snapshotCount;
+  const result = await runtime.call('browser_semantic_plan',{actions:[
+    {type:'click',target:{name:'Open later',roleHint:'button'}},
+    {type:'assert',kind:'visible',target:{name:'Delayed form',roleHint:'dialog'}}]});
+  assert.equal(result.isError,false,JSON.stringify(result));
+  assert.equal(runtime.snapshotCount,before);
+  assert.ok(result.logEvents.includes('[UI] dialog detected'));
+});
+
+live('navigate and URL assertion use the semantic executor',async () => {
+  const before = runtime.snapshotCount;
+  const result = await runtime.call('browser_semantic_plan',{actions:[
+    {type:'navigate',url:'about:blank'},
+    {type:'assert',kind:'url',expected:'about:blank'}]});
+  assert.equal(result.isError,false,JSON.stringify(result));
+  assert.equal(result.evidenceIds.length,1);
+  assert.equal(runtime.snapshotCount,before);
 });
 
 live('recording contains the exact executed stable-ID locator',async () => {

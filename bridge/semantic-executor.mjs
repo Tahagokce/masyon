@@ -3,7 +3,7 @@ import {resolveLocator} from './locator-resolver.mjs';
 import {debugSnapshot} from './snapshot.mjs';
 import {assertionRequest, assertionResolved} from './assertion-logging.mjs';
 
-const ACTIONS = new Set(['click','fill','select','check','uncheck','press','assert']);
+const ACTIONS = new Set(['click','fill','select','check','uncheck','press','navigate','assert']);
 const ASSERTIONS = new Set(['visible','hidden','text','value','enabled','disabled',
   'checked','unchecked','selected','unselected','url']);
 const pause = ms => new Promise(resolve => setTimeout(resolve,ms));
@@ -31,7 +31,9 @@ function resultForDecision(runtime, status, candidates, inputValues) {
     ? 'AMBIGUOUS_TARGET: Multiple UI elements match the semantic target; refine the role/name or inspect once.'
     : 'UNRESOLVED_TARGET: No unique actionable UI element matches; refine the target or inspect once.';
   emit(runtime,`[RESOLVE] ${status} candidates=${safe.length}`);
-  return {isError:false,denied:true,needsDecision:true,reason,candidates:safe,executed:false};
+  return {isError:false,denied:true,needsDecision:true,reason,
+    resolverStatus:status === 'ambiguous' ? 'AMBIGUOUS' : 'NO_MATCH',
+    candidates:safe,executed:false};
 }
 
 async function selected(locator) {
@@ -75,17 +77,26 @@ export async function executeSemanticAction(runtime, action, entry) {
   if (action.type === 'assert' && !ASSERTIONS.has(action.kind)) throw new Error('Unsupported semantic assertion kind');
   const inputValues = await runtime.currentFormValues().catch(() => []);
   const target = safeTarget(runtime,action.target,inputValues);
-  emit(runtime,`[PLAN]\naction=${action.type}\ntarget.name=${JSON.stringify(target.name || '')}\ntarget.roleHint=${JSON.stringify(target.roleHint || '')}`);
+  emit(runtime,`[PLAN] action=${action.type} target=${JSON.stringify(target.name || target.label || target.text || '')} role=${target.roleHint || ''}`);
   const isUrl = action.type === 'assert' && action.kind === 'url';
   const isPagePress = action.type === 'press' && !action.target;
+  const isNavigate = action.type === 'navigate';
   let inventory = [], resolved;
-  if (!isUrl && !isPagePress) {
-    inventory = await uiInventory(runtime.active,{includeHidden:action.type === 'assert' && action.kind === 'hidden'});
+  if (!isUrl && !isPagePress && !isNavigate) {
+    const includeHidden = action.type === 'assert' && action.kind === 'hidden';
+    const deadline = action.type === 'assert' ? Date.now() + 5000 : 0;
+    do {
+      inventory = await uiInventory(runtime.active,{includeHidden});
+      resolved = await resolveLocator(runtime.active,action.target,inventory,
+        {includeDisabled:action.type === 'assert',includeHidden});
+      if (!['missing','unresolved'].includes(resolved.status) || Date.now() >= deadline) break;
+      await pause(100);
+    } while (true);
     emit(runtime,`[INVENTORY] candidateCount=${inventory.length}`);
-    resolved = await resolveLocator(runtime.active,action.target,inventory,
-      {includeDisabled:action.type === 'assert',includeHidden:action.type === 'assert' && action.kind === 'hidden'});
     if (resolved.status !== 'resolved') return {...resultForDecision(runtime,resolved.status,
       resolved.candidates || [],inputValues),inventoryCount:inventory.length};
+    if (action.type === 'assert' && resolved.candidate.role === 'dialog' && resolved.candidate.visible)
+      emit(runtime,'[UI] dialog detected');
     const item = JSON.parse(debugSnapshot({role:resolved.candidate.role,name:resolved.candidate.name,
       id:resolved.candidate.id},inputValues,runtime.guard));
     emit(runtime,`[RESOLVE] matched role=${item.role} name=${JSON.stringify(item.name)} id=${JSON.stringify(item.id)}`);
@@ -122,6 +133,7 @@ export async function executeSemanticAction(runtime, action, entry) {
         'ran playwright code':code,resolvedLocator:expression,inventoryCount:inventory.length};
     }
     const evidenceId = `assertion-${++runtime.evidence}`;
+    emit(runtime,`[ASSERT] ${action.kind} verified evidence=${evidenceId}`);
     return {isError:false,executed:true,evidenceId,
       assertion:{kind:action.kind,targetDescriptor:action.target,expected:action.expected},
       'ran playwright code':code,resolvedLocator:expression,inventoryCount:inventory.length};
@@ -164,6 +176,13 @@ export async function executeSemanticAction(runtime, action, entry) {
     entry.code = runtime.guard.assertCode(code);
     if (isPagePress) await runtime.active.keyboard.press(key);
     else await locator.press(key);
+  } else if (action.type === 'navigate') {
+    const url = new URL(action.url);
+    if ((!['http:','https:'].includes(url.protocol) && action.url !== 'about:blank') ||
+        url.username || url.password) throw new Error('Navigation requires HTTP(S) without embedded credentials');
+    code = `await page.goto(${JSON.stringify(action.url)});`;
+    entry.code = runtime.guard.assertCode(code);
+    await runtime.active.goto(action.url);
   }
   emit(runtime,`[ACTION] ${action.type} successful`);
   return {isError:false,executed:true,'ran playwright code':code,
@@ -183,6 +202,7 @@ export async function executeSemanticPlan(runtime, args) {
   const last = results.at(-1);
   return {isError:Boolean(last.isError),error:last.error,errorClass:last.errorClass,
     denied:Boolean(last.denied),needsDecision:Boolean(last.needsDecision),reason:last.reason,
+    resolverStatus:last.resolverStatus,
     candidates:last.candidates,executed:results.some(result => result.executed),
     mutating:results.some(result => result.mutating),transition:results.some(result => result.transition),
     checkpointRequired:results.some(result => result.transition),

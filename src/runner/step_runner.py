@@ -2,13 +2,15 @@ import asyncio
 import json
 from google.genai import types
 from src.gemini.context import StepContext
+from src.gemini.semantic_plan import validate_plan
 
 
-async def run_step(step, ai, browser, state, config, secrets, log):
+async def run_fallback_step(step, ai, browser, state, config, secrets, log,
+                            *, prestarted=False, semantic_result=None):
     context = StepContext(step, config, secrets)
-    evidence, actions, errors = {}, 0, False
-    latest_mutation = 0
-    sequence = 0
+    evidence, actions, errors = {}, int(bool(semantic_result and semantic_result.get("executed"))), False
+    latest_mutation = int(bool(semantic_result and semantic_result.get("mutating")))
+    sequence = int(bool(semantic_result))
     calls = 0
     no_progress = 0
 
@@ -16,7 +18,15 @@ async def run_step(step, ai, browser, state, config, secrets, log):
         return {"stepNumber": step.stepNumber, "status": status, "reason": reason,
                 "verification": "", "evidence": list(evidence.values())}
 
-    if any(tool["name"] == "poc_step_start" for tool in browser.tools):
+    if semantic_result:
+        context.resolver_failure = secrets.object({key:semantic_result.get(key) for key in
+            ("resolverStatus", "reason", "candidates") if semantic_result.get(key) is not None})
+        ids = semantic_result.get("evidenceIds") or []
+        assertions = semantic_result.get("assertions") or []
+        for index, item_id in enumerate(ids):
+            evidence[item_id] = {"id":item_id,"sequence":sequence,"page":semantic_result.get("activePage"),
+                                 "assertion":assertions[index] if index < len(assertions) else None}
+    if not prestarted and any(tool["name"] == "poc_step_start" for tool in browser.tools):
         try:
             started = await browser.call("poc_step_start", {"stepNumber": step.stepNumber})
         except Exception as exc:
@@ -141,3 +151,66 @@ async def run_step(step, ai, browser, state, config, secrets, log):
         details = {**secrets.diagnostic(exc), "stepNumber":step.stepNumber, "activePage":state.active_page}
         log("[ERROR] " + json.dumps(details, ensure_ascii=False))
         return {**failed("BLOCKED", f"{details['errorClass']}: {details['error']}"), "errorDetails":details}
+
+
+async def run_step(step, ai, browser, state, config, secrets, log):
+    """Every production step plans and executes semantics before model tool choice."""
+    if not any(tool["name"] == "browser_semantic_plan" for tool in browser.tools):
+        return {"stepNumber":step.stepNumber,"status":"BLOCKED",
+                "reason":"Semantic plan executor is unavailable", "verification":"", "evidence":[]}
+    try:
+        if any(tool["name"] == "poc_step_start" for tool in browser.tools):
+            started = await browser.call("poc_step_start", {"stepNumber":step.stepNumber})
+            for event in started.pop("logEvents", []): log(event)
+            if started.get("isError"):
+                raise RuntimeError(started.get("error", "Jira step page lock failed"))
+            state.observe(started)
+        async with asyncio.timeout(config.step_timeout):
+            plan = await ai.plan_step(step,state.compact(),config.base_url,config.secret_names)
+            actions = validate_plan(plan,step.expectedResult)
+            if secrets.contains(json.dumps(plan,ensure_ascii=False)):
+                raise ValueError("Semantic plan contains a raw credential")
+            log(f"[PLAN] Step {step.stepNumber}: {len(plan['actions'])} actions, "
+                f"{len(plan['expectedAssertions'])} expected assertions")
+            result = await browser.call("browser_semantic_plan",{"actions":actions})
+    except (ValueError, AttributeError, KeyError) as exc:
+        return {"stepNumber":step.stepNumber,"status":"BLOCKED",
+                "reason":"Semantic planning failed: " + secrets.diagnostic(exc)["error"],
+                "verification":"", "evidence":[]}
+    except TimeoutError:
+        return {"stepNumber":step.stepNumber,"status":"BLOCKED",
+                "reason":"Semantic planning or execution timed out", "verification":"", "evidence":[]}
+    except Exception as exc:
+        return {"stepNumber":step.stepNumber,"status":"BLOCKED",
+                "reason":"Semantic plan could not execute: " + secrets.diagnostic(exc)["error"],
+                "verification":"", "evidence":[]}
+    for event in result.pop("logEvents", []): log(event)
+    state.metrics["browserToolCalls"] += result.get("batchExecuted",1)
+    state.observe(result)
+    if result.get("resolverStatus") in {"NO_MATCH","AMBIGUOUS"}:
+        log(f"[RESOLVE] {result['resolverStatus']} candidates={len(result.get('candidates') or [])}")
+        return await run_fallback_step(step,ai,browser,state,config,secrets,log,
+                                       prestarted=True,semantic_result=result)
+    if result.get("isError"):
+        detail = secrets.object({"tool":"browser_semantic_plan", "errorClass":result.get("errorClass","BrowserToolError"),
+                                 "message":result.get("error","operation did not succeed"),
+                                 "activePage":state.active_page,"stepNumber":step.stepNumber})
+        log("[MCP] " + json.dumps(detail,ensure_ascii=False))
+        return {"stepNumber":step.stepNumber,"status":"FAILED",
+                "reason":f"Semantic browser execution failed: {detail['message']}",
+                "verification":"","evidence":[],"errorDetails":detail}
+    ids = result.get("evidenceIds") or []
+    assertions = result.get("assertions") or []
+    complete = result.get("executed") and not result.get("remainingActions") and not result.get("denied")
+    verified = len(ids) == len(plan["expectedAssertions"])
+    if not complete or not verified:
+        return {"stepNumber":step.stepNumber,"status":"BLOCKED",
+                "reason":"Semantic plan did not execute and verify every expected assertion",
+                "verification":"","evidence":[]}
+    evidence = [{"id":item_id,"sequence":1,"assertion":assertions[index] if index < len(assertions) else None,
+                 "page":result.get("activePage")} for index,item_id in enumerate(ids)]
+    state.completed_steps.append(step.stepNumber)
+    state.summary = secrets.clean((step.expectedResult or step.action)[:400])
+    return secrets.object({"stepNumber":step.stepNumber,"status":"COMPLETED",
+                           "reason":"Semantic plan actions and expected assertions completed",
+                           "verification":step.expectedResult,"evidence":evidence})

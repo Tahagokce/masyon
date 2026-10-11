@@ -8,15 +8,11 @@ value later. Omit value for a unique automation ID; supply value for a required
 format such as a date or number. Never generate or register credentials.
 Use named credentials as fill/type values, e.g. WBS_USERNAME and WBS_PASSWORD.
 Never ask for, emit, or discover raw secrets. Do not inspect cookies or storage.
-Plan normal UI work with browser_semantic_plan. Supply actions with type and a
-semantic target (name, roleHint, label, text, placeholder); supply value for fill
-or select, key for press, and kind/expected for assertions. Derive target names
-from the Jira instruction and rendered UI wording. Never invent DOM IDs, CSS
-selectors, or snapshot refs. The browser inventories the whole active page and
-chooses locators deterministically. Include expected-result assertions in the
-plan when the target is clear. If resolution is ambiguous or unresolved, refine
-the semantic target or inspect once to make a higher-level decision.
-Use browser_snapshot only for debugging, unexpected UI state, ambiguity, or
+The runner already requested and executed a mandatory semantic plan before this
+fallback conversation. Inspect resolverFailure: NO_MATCH or AMBIGUOUS gives the
+reason and candidates. Refine the semantic target and use browser_semantic_plan
+when the intent is clear. Never invent DOM IDs, CSS selectors, or snapshot refs.
+Use browser_snapshot only after a resolver failure, unexpected UI state, or
 legacy assertion recovery. It is not the normal locator discovery path.
 Legacy snapshot-ref browser actions remain available when needed.
 Older snapshots are removed; only latestInspection and compact state remain.

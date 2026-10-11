@@ -74,7 +74,7 @@ class CompletionTests(unittest.IsolatedAsyncioTestCase):
     """Protocol unit tests only. Scripted responses do NOT qualify as Gemini acceptance."""
     async def execute(self, calls, expected='Welcome is visible'):
         from google.genai import types
-        from src.runner.step_runner import run_step
+        from src.runner.step_runner import run_fallback_step
         from src.jira.models import Step
         class FakeAI:
             async def request(self, contents):
@@ -87,7 +87,7 @@ class CompletionTests(unittest.IsolatedAsyncioTestCase):
                     return {'executed':True, 'evidenceId':'a1', 'assertion':args, 'activePage':'page'}
                 return {'executed':True, 'mutating':True}
         config = Config(['node'], '', [], len(calls), 5, 5)
-        return await run_step(Step(1,'Log in','',expected), FakeAI(), FakeBrowser(), ExecutionState(), config, Secrets([]), lambda _:None)
+        return await run_fallback_step(Step(1,'Log in','',expected), FakeAI(), FakeBrowser(), ExecutionState(), config, Secrets([]), lambda _:None)
 
     async def test_false_success_is_rejected(self):
         result = await self.execute([('finish_step',{'status':'COMPLETED','reason':'done','evidenceIds':['invented'],'verification':'looks good'})])

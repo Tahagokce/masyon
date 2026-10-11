@@ -27,8 +27,8 @@ const schema = (name, description, properties = {}, required = []) => ({name, de
 const semanticTarget = {type:'object',properties:{name:str,roleHint:str,label:str,text:str,placeholder:str},
   additionalProperties:false};
 const semanticAction = {type:'object',properties:{
-  type:{type:'string',enum:['click','fill','select','check','uncheck','press','assert']},
-  target:semanticTarget,value:str,key:str,
+  type:{type:'string',enum:['click','fill','select','check','uncheck','press','navigate','assert']},
+  target:semanticTarget,value:str,key:str,url:str,
   kind:{type:'string',enum:['visible','hidden','text','value','enabled','disabled','checked','unchecked','selected','unselected','url']},
   expected:str},required:['type'],additionalProperties:false};
 export const CONTROL_TOOLS = [
@@ -554,6 +554,8 @@ export class Runtime {
           const inventory = await uiInventory(this.active);
           result.inventoryCount = inventory.length;
           this.emit(`[INVENTORY] candidateCount=${inventory.length}`);
+          if (inventory.some(item => item.role === 'dialog' && item.visible))
+            this.emit('[UI] dialog detected');
         } catch { this.emit('[INVENTORY] unavailable after action'); }
       }
       if (this.logging && name !== 'browser_snapshot' && name !== 'browser_semantic_action') {
@@ -585,6 +587,7 @@ export class Runtime {
         result:result.result, error:result.error, snapshot:result.snapshot,
         modalState:result['modal state'], evidenceId:result.evidenceId, assertion:result.assertion,
         denied:result.denied, needsDecision:result.needsDecision, reason:result.reason,
+        resolverStatus:result.resolverStatus,
         candidates:result.candidates, inventoryCount:result.inventoryCount,
         activePage:this.pages.get(this.active)?.alias, pages:this.pageState(),
         recoverable:result.recoverable, recoveryIncomplete:result.recoveryIncomplete,

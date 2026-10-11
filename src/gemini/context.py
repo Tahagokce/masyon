@@ -16,6 +16,7 @@ class StepContext:
         self.latest_exchange = None
         self.snapshot = None
         self.operations = []
+        self.resolver_failure = None
 
     def observe(self, name, args, result):
         if result.get("mutating") or result.get("transition") or (name == "browser_snapshot" and result.get("isError")):
@@ -28,7 +29,7 @@ class StepContext:
                 "batchExecuted":result.get("batchExecuted"), "status":"ok"}))
             self.operations = self.operations[-8:]
         # Snapshot lives once in the current context, never in historical replies.
-        keep = ("isError","executed","unchanged","denied","needsDecision","candidates","inventoryCount",
+        keep = ("isError","executed","unchanged","denied","needsDecision","resolverStatus","candidates","inventoryCount",
                 "error","errorClass","recoverable","evidenceId","evidenceIds","assertion","assertions",
                 "transition","checkpointRequired","batchExecuted","remainingActions","results","value","reason","modalState")
         return self.secrets.object({k:result[k] for k in keep if result.get(k) is not None})
@@ -41,4 +42,5 @@ class StepContext:
         current = {"state":state.compact(), "verificationEvidence":list(evidence.values()),
                    "recentOperations":self.operations}
         if self.snapshot: current["latestInspection"] = self.snapshot
+        if self.resolver_failure: current["resolverFailure"] = self.resolver_failure
         return [self.initial, content(self.secrets.object(current)), *(self.latest_exchange or ())]
