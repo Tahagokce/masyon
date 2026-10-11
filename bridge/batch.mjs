@@ -39,7 +39,8 @@ export async function executeBatch(runtime, args) {
     try { result = await runtime.call(action.tool, action.arguments); }
     catch (error) {
       result = {isError:true, executed:false, mutating:true,
-        ...runtime.guard.diagnostic(error, action.tool, runtime.pages.get(runtime.active)?.alias)};
+        ...runtime.guard.diagnostic(error, action.tool, runtime.pages.get(runtime.active)?.alias),
+        logEvents:runtime.drainLogEvents()};
     }
     results.push({tool:action.tool, ...result});
     const after = await screenStamp(runtime);
@@ -54,6 +55,7 @@ export async function executeBatch(runtime, args) {
     failedTool:last.isError?last.tool:undefined, modalState:last.modalState,
     executed:results.some(r => r.executed), mutating:results.some(r => r.mutating),
     results:results.map(({tool,isError,error,errorClass,executed}) => ({tool,isError,error,errorClass,executed})),
+    logEvents:results.flatMap(result => result.logEvents || []),
     batchExecuted:results.length, remainingActions:actions.length-results.length,
     transition:checkpoint, checkpointRequired:checkpoint, activePage:runtime.pages.get(runtime.active)?.alias,
     pages:runtime.pageState(), metrics:runtime.metrics()};

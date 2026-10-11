@@ -34,7 +34,10 @@ export async function inspectSnapshot(runtime, args) {
     }
     if (locator) { options.target = locator.toString(); scoped = true; }
     const result = await runtime.raw('browser_snapshot', options);
-    if (!result.isError) return {...result, notices, snapshotScope:scoped?'target':'page'};
+    if (!result.isError) {
+      runtime.capturedSnapshot?.();
+      return {...result, notices, snapshotScope:scoped?'target':'page'};
+    }
     if (!scoped) return inspectionFailure(runtime, result, notices);
   } catch (error) {
     if (runtime.active?.isClosed()) throw error;
@@ -44,8 +47,9 @@ export async function inspectSnapshot(runtime, args) {
   notices.push('[SNAPSHOT] Falling back to whole-page snapshot');
   try {
     const fallback = await runtime.raw('browser_snapshot', {depth:args.depth ?? 5});
-    return fallback.isError ? inspectionFailure(runtime, fallback, notices)
-      : {...fallback, notices, snapshotScope:'page', snapshotFallback:true};
+    if (fallback.isError) return inspectionFailure(runtime, fallback, notices);
+    runtime.capturedSnapshot?.();
+    return {...fallback, notices, snapshotScope:'page', snapshotFallback:true};
   } catch (error) { return inspectionFailure(runtime, {error:error.message, errorClass:error.name}, notices); }
 }
 

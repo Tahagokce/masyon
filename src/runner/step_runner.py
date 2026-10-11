@@ -23,6 +23,7 @@ async def run_step(step, ai, browser, state, config, secrets, log):
             return failed("BLOCKED", "Jira step page lock could not start: " + secrets.diagnostic(exc)["error"])
         if started.get("isError"):
             return failed("BLOCKED", "Jira step page lock could not start: " + started.get("error", "unknown error"))
+        for event in started.pop("logEvents", []): log(event)
         state.observe(started)
 
     async def loop():
@@ -80,6 +81,7 @@ async def run_step(step, ai, browser, state, config, secrets, log):
                         result = await browser.call(name, args)
                     except Exception as exc:
                         result = {"isError":True, **secrets.diagnostic(exc), "activePage":state.active_page}
+                    for event in result.pop("logEvents", []): log(event)
                     state.metrics["browserToolCalls"] += result.get("batchExecuted", 1)
                     state.observe(result)
                     for notice in result.get("notices") or []: log(notice)

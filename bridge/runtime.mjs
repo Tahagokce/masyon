@@ -10,6 +10,7 @@ import { SecretGuard } from './security.mjs';
 import { inspectSnapshot, compactSnapshot } from './snapshot.mjs';
 import { executeBatch, screenStamp, BATCH_TOOLS } from './batch.mjs';
 import { staleRef, descriptor, hasUsableDescriptor, rememberSnapshotRefs, resolveAssertionTarget } from './assertion-recovery.mjs';
+import { actionLogLines } from './action-logging.mjs';
 
 const require = createRequire(import.meta.url);
 const ALLOWED = new Set(['browser_navigate', 'browser_navigate_back', 'browser_navigate_forward',
@@ -77,7 +78,21 @@ export class Runtime {
     this.topologyVersion = 0;
     this.step = null;
     this.refDescriptors = new Map();
+    this.logLevel = (process.env.LOG_LEVEL || 'INFO').toUpperCase();
+    this.logLocators = process.env.LOG_LOCATORS?.toLowerCase() === 'true';
+    this.logEvents = [];
+    this.stateVersion = 0;
   }
+  get logging() { return this.logLevel === 'DEBUG' || this.logLocators; }
+  emit(line) { if (this.logging) this.logEvents.push(this.guard.clean(line)); }
+  drainLogEvents() { return this.logEvents.splice(0); }
+  stateLine() {
+    const alias = this.pages.get(this.active)?.alias || 'unknown';
+    const url = (this.pageState().find(page => page.alias === alias)?.url || 'about:blank')
+      .replace(/(\/(?:access[_-]?token|refresh[_-]?token|api[_-]?key|token|session|auth|secret|key)\/)[^/?#]+/gi, '$1[REDACTED]');
+    return `[STATE] v${this.stateVersion} page=${alias} url=${url}`;
+  }
+  capturedSnapshot() { if (this.logLevel === 'DEBUG') this.emit(`[SNAPSHOT] captured state=v${this.stateVersion}`); }
   async initialize() {
     const launch = {headless: process.env.HEADLESS !== 'false'};
     if (process.env.PLAYWRIGHT_EXECUTABLE_PATH) launch.executablePath = process.env.PLAYWRIGHT_EXECUTABLE_PATH;
@@ -128,7 +143,10 @@ export class Runtime {
       if (!entry) this.journal.problem = 'Page opened without a recordable originating action';
       else entry.pages.push(info);
     }
-    this.events.push(page.opener().then(opener => {info.opener = this.pages.get(opener)?.alias || null;}));
+    this.events.push(page.opener().then(opener => {
+      info.opener = this.pages.get(opener)?.alias || null;
+      this.emit(`[PAGE] new page detected: ${alias} opener=${info.opener || 'none'}`);
+    }));
     page.on('dialog', dialog => {
       this.dialog = {dialog, page, origin: this.inflight?.mutating ? this.inflight : this.lastMutation};
     });
@@ -170,6 +188,7 @@ export class Runtime {
     const result = await this.raw('browser_tabs', {action:'select', index});
     if (result.isError) throw new Error('Cannot select page in MCP');
     this.active = page;
+    this.emit(`[PAGE] active page -> ${this.pages.get(page)?.alias || 'unknown'}`);
   }
   async synchronize() {
     await Promise.all(this.events.splice(0));
@@ -177,7 +196,12 @@ export class Runtime {
     const open = this.context.pages();
     if (this.newest && open.includes(this.newest) && this.newest !== this.active) await this.select(this.newest);
     this.newest = null;
-    if (this.active?.isClosed()) this.active = this.mcpContext?.currentTab()?.page;
+    if (this.active?.isClosed()) {
+      const previous = this.active;
+      this.active = this.mcpContext?.currentTab()?.page;
+      if (this.active && this.active !== previous)
+        this.emit(`[PAGE] active page -> ${this.pages.get(this.active)?.alias || 'unknown'}`);
+    }
   }
   pageState() {
     return [...this.pages.values()].map(info => {
@@ -248,6 +272,7 @@ export class Runtime {
           await new Promise(resolve => setTimeout(resolve, 100));
         }`;
       const result = await this.raw(this.runCodeName, {code:`async (page) => { ${body} }`});
+      result.resolvedLocator = expression || undefined;
       let verified = false;
       try { verified = JSON.parse(result.result || '{}').verified === true; } catch {}
       if (!verified) result.isError = true;
@@ -322,6 +347,7 @@ export class Runtime {
       this.hasRecorded = true;
       this.lastMutation = null;
       this.journal.start();
+      this.drainLogEvents();
       return {started:true, metrics:this.metrics(), activePage:this.pages.get(this.active)?.alias, pages:this.pageState()};
     }
     if (name === 'poc_step_start') {
@@ -331,7 +357,9 @@ export class Runtime {
       this.step = {number:args.stepNumber, lockedPage:this.pages.get(this.active)?.alias,
         switchVersion:this.topologyVersion, revision:0, snapshotRevision:null,
         snapshotTopology:null, snapshotPage:null};
-      return {activePage:this.step.lockedPage, pages:this.pageState(), metrics:this.metrics()};
+      if (this.logLevel === 'DEBUG') this.emit(this.stateLine());
+      return {activePage:this.step.lockedPage, pages:this.pageState(), metrics:this.metrics(),
+        logEvents:this.drainLogEvents()};
     }
     if (name === 'poc_record_stop') {
       if (!this.journal.active) throw new Error('Recording not started');
@@ -358,12 +386,12 @@ export class Runtime {
     if (name === 'browser_snapshot' && this.step && this.step.snapshotRevision === this.step.revision &&
         this.step.snapshotTopology === this.topologyVersion && this.step.snapshotPage === alias) {
       return {isError:false, unchanged:true, reason:'UNCHANGED: The active page and browser state have not changed. Use the existing inspection to assert, take a meaningful action, or finish BLOCKED.',
-        activePage:alias, pages:this.pageState(), metrics:this.metrics()};
+        activePage:alias, pages:this.pageState(), metrics:this.metrics(), logEvents:this.drainLogEvents()};
     }
     if (name === 'browser_switch_page' && this.step &&
         (args.page === alias || this.topologyVersion <= this.step.switchVersion)) {
       return {isError:false, denied:true, reason:`PAGE_LOCKED: ${alias} remains active for Jira step ${this.step.number}; no new page or navigation requires a switch. Assert on this page or finish BLOCKED.`,
-        activePage:alias, pages:this.pageState(), metrics:this.metrics()};
+        activePage:alias, pages:this.pageState(), metrics:this.metrics(), logEvents:this.drainLogEvents()};
     }
     const mutating = !READ.has(name) && name !== 'browser_assert';
     const beforeScreen = mutating ? await screenStamp(this) : undefined;
@@ -371,6 +399,7 @@ export class Runtime {
     this.inflight = entry;
     if (mutating) this.lastMutation = entry;
     let result;
+    let actionLogged = false;
     try {
       if (name === 'browser_snapshot') {
         result = await inspectSnapshot(this, args);
@@ -418,6 +447,16 @@ export class Runtime {
       if (!result.isError && mutating && !code && !['browser_switch_page','browser_handle_dialog'].includes(name))
         throw new Error('Action succeeded without generated code; recording is incomplete');
       await this.synchronize();
+      if (this.logging && name !== 'browser_snapshot') {
+        const actionLines = actionLogLines(name, alias, code, result.resolvedLocator, args,
+          this.guard, this.logLocators);
+        this.logEvents.unshift(...actionLines);
+        actionLogged = true;
+      }
+      if (mutating && !result.isError) {
+        this.stateVersion++;
+        if (this.logLevel === 'DEBUG') this.emit(this.stateLine());
+      }
       if (this.step && !result.isError) {
         if (mutating) this.step.revision++;
         if (name === 'browser_snapshot') {
@@ -441,12 +480,16 @@ export class Runtime {
         snapshotFallback:result.snapshotFallback,
         errorClass:result.isError?(result.errorClass || 'PlaywrightError'):undefined,
         transition:mutating && (beforeScreen !== await screenStamp(this) || !beforeScreen ||
-          ['browser_click','browser_press_key','browser_handle_dialog'].includes(name)), metrics:this.metrics()};
+          ['browser_click','browser_press_key','browser_handle_dialog'].includes(name)), metrics:this.metrics(),
+        logEvents:this.drainLogEvents()};
       Object.assign(compact, compactSnapshot(compact.snapshot));
       if (compact.snapshotTruncated) compact.hint = 'Snapshot trimmed. Inspect a specific target or increase depth for omitted content.';
       if (compact.isError) Object.assign(compact, this.guard.diagnostic({name:compact.errorClass,message:compact.error}, name, compact.activePage));
       return this.guard.object(compact);
     } catch (error) {
+      if (this.logging && !actionLogged && name !== 'browser_snapshot')
+        this.logEvents.unshift(...actionLogLines(name, alias, result?.['ran playwright code'],
+          result?.resolvedLocator, args, this.guard, this.logLocators));
       if (mutating) this.journal.problem ||= 'An action could not be recorded completely';
       throw error;
     } finally { this.inflight = null; }

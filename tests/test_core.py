@@ -60,8 +60,12 @@ class SecurityStateTests(unittest.TestCase):
 
     def test_command_is_argv_and_gemini_key_not_forwarded(self):
         from src.mcp.process import process_environment
-        with patch.dict(os.environ, {'GEMINI_API_KEY':'private-api-key', 'WBS_PASSWORD':'secret'}):
-            self.assertNotIn('GEMINI_API_KEY', process_environment(['WBS_PASSWORD']))
+        with patch.dict(os.environ, {'GEMINI_API_KEY':'private-api-key', 'WBS_PASSWORD':'secret',
+                                    'LOG_LEVEL':'DEBUG', 'LOG_LOCATORS':'true'}):
+            child = process_environment(['WBS_PASSWORD'])
+            self.assertNotIn('GEMINI_API_KEY', child)
+            self.assertEqual(child['LOG_LEVEL'], 'DEBUG')
+            self.assertEqual(child['LOG_LOCATORS'], 'true')
         with patch.dict(os.environ, {'PLAYWRIGHT_MCP_COMMAND':'"npx @playwright/mcp"'}):
             with self.assertRaises(ValueError): Config.from_env()
 

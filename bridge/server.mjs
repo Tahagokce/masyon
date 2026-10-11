@@ -15,7 +15,8 @@ server.setRequestHandler(CallToolRequestSchema, request => {
     } catch (error) {
       return {isError:true, content:[{type:'text',text:JSON.stringify({isError:true,
         ...runtime.guard.diagnostic(error, request.params.name, runtime.pages.get(runtime.active)?.alias),
-        pages:runtime.guard.object(runtime.pageState()), metrics:runtime.metrics()})}]};
+        pages:runtime.guard.object(runtime.pageState()), metrics:runtime.metrics(),
+        logEvents:runtime.drainLogEvents()})}]};
     }
   });
   queue = task.catch(() => {});

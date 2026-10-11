@@ -106,6 +106,11 @@ and underlying MCP calls. Metrics also include `snapshotCount`,
 `browserToolCalls` counts individual operations in batches; `mcpToolCalls` includes
 preflight and internal context/locator calls. `contextCharactersSent` measures
 serialized conversation size, not tokens, and excludes system/tool definitions.
+Set `LOG_LEVEL=DEBUG` for browser state and snapshot version lines in `run.log`.
+Set `LOG_LOCATORS=true` to log each action's actual locator from the fork-generated
+Playwright code. Its default is `false`; fill values are always masked in action
+logs. These runtime lines are kept out of the Gemini tool conversation and the
+generated `recording.spec.ts`.
 Failure recordings preserve available action code and
 end in an explicit failure. When no recording was obtained, the `.spec.ts` is an
 explicitly failing diagnostic marker, never a claimed successful recording.
